@@ -152,3 +152,58 @@ func expandPath(path string) string {
 	}
 	return path
 }
+
+// migrateFromOpenClaw imports settings from OpenClaw config on first run.
+// Only copies settings that aren't already configured in CCC.
+func migrateFromOpenClaw(config *Config) bool {
+	home, _ := os.UserHomeDir()
+	ocPath := filepath.Join(home, ".openclaw", "openclaw.json")
+
+	data, err := os.ReadFile(ocPath)
+	if err != nil {
+		return false
+	}
+
+	var ocConfig map[string]interface{}
+	if err := json.Unmarshal(data, &ocConfig); err != nil {
+		return false
+	}
+
+	changed := false
+
+	// Import gateway settings
+	if config.Gateway == nil {
+		if gw, ok := ocConfig["gateway"].(map[string]interface{}); ok {
+			config.Gateway = &GatewayConfig{Enabled: true}
+			if port, ok := gw["port"].(float64); ok {
+				config.Gateway.Port = int(port)
+			}
+			if auth, ok := gw["auth"].(map[string]interface{}); ok {
+				if token, ok := auth["token"].(string); ok {
+					config.Gateway.Token = token
+				}
+			}
+			changed = true
+		}
+	}
+
+	// Import Signal settings
+	if config.Channels == nil || config.Channels.Signal == nil {
+		if channels, ok := ocConfig["channels"].(map[string]interface{}); ok {
+			if sig, ok := channels["signal"].(map[string]interface{}); ok {
+				if config.Channels == nil {
+					config.Channels = &ChannelsConfig{}
+				}
+				config.Channels.Signal = &SignalConfig{
+					Enabled: true,
+				}
+				if cliPath, ok := sig["cliPath"].(string); ok {
+					config.Channels.Signal.CLIPath = cliPath
+				}
+				changed = true
+			}
+		}
+	}
+
+	return changed
+}

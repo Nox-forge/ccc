@@ -530,6 +530,100 @@ func doctor() {
 		fmt.Println("⚠️  not set (optional)")
 	}
 
+	// --- Gateway checks ---
+	fmt.Println()
+	fmt.Println("🌐 Gateway")
+
+	fmt.Print("persistence db.... ")
+	dbPath := getDBPath()
+	if _, err := os.Stat(dbPath); err == nil {
+		if err := initStore(); err == nil {
+			result, err := store.CheckIntegrity()
+			if err == nil && result == "ok" {
+				stats, _ := store.Stats()
+				fmt.Printf("✅ %s (%d sessions, %d messages, %d snapshots)\n",
+					dbPath, stats["sessions"], stats["messages"], stats["snapshots"])
+			} else {
+				fmt.Printf("⚠️  integrity check: %s (err: %v)\n", result, err)
+			}
+		} else {
+			fmt.Printf("⚠️  open error: %v\n", err)
+		}
+	} else {
+		fmt.Println("⚠️  not created yet (will be created on first use)")
+	}
+
+	fmt.Print("gateway port...... ")
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", gatewayWSPort))
+	if err == nil {
+		resp.Body.Close()
+		fmt.Printf("✅ listening on :%d\n", gatewayWSPort)
+	} else {
+		fmt.Printf("⚠️  not running (start with: ccc listen)\n")
+	}
+
+	// --- Channel checks ---
+	fmt.Println()
+	fmt.Println("📡 Channels")
+
+	fmt.Print("signal-cli........ ")
+	if cliPath := findSignalCLI(); cliPath != "" {
+		fmt.Printf("✅ %s\n", cliPath)
+		if isSignalConfigured(config) {
+			sigCount := 0
+			for _, info := range config.Sessions {
+				if info != nil && info.SignalNumber != "" {
+					sigCount++
+				}
+			}
+			fmt.Printf("  sessions........ ✅ %d with signal numbers\n", sigCount)
+		} else {
+			fmt.Println("  sessions........ ⚠️  no sessions have signal_number configured")
+		}
+	} else {
+		fmt.Println("⚠️  not found (optional)")
+	}
+
+	fmt.Print("discord........... ")
+	if os.Getenv("DISCORD_BOT_TOKEN") != "" {
+		fmt.Println("✅ bot token set")
+	} else {
+		fmt.Println("⚠️  DISCORD_BOT_TOKEN not set (optional)")
+	}
+
+	// --- Skills checks ---
+	fmt.Println()
+	fmt.Println("📚 Skills")
+
+	skills := scanSkills()
+	fmt.Printf("total skills...... %d\n", len(skills))
+	syncedCount := 0
+	for _, s := range skills {
+		if s.Synced {
+			syncedCount++
+		}
+	}
+	fmt.Printf("synced to claude.. %d\n", syncedCount)
+
+	skillsDirs := getSkillDirs()
+	for source, dir := range skillsDirs {
+		fmt.Printf("  %-14s.. ", source)
+		if dir == "" {
+			fmt.Println("not found")
+		} else if _, err := os.Stat(dir); err != nil {
+			fmt.Println("not found")
+		} else {
+			entries, _ := os.ReadDir(dir)
+			count := 0
+			for _, e := range entries {
+				if strings.HasSuffix(e.Name(), ".md") {
+					count++
+				}
+			}
+			fmt.Printf("✅ %d skills in %s\n", count, dir)
+		}
+	}
+
 	fmt.Println()
 	if allGood {
 		fmt.Println("✅ All checks passed!")
@@ -1089,7 +1183,8 @@ func listen() error {
 func printHelp() {
 	fmt.Printf(`ccc - Claude Code Companion v%s
 
-Your companion for Claude Code - control sessions remotely via Telegram and tmux.
+Your companion for Claude Code - control sessions remotely via Telegram, Signal,
+Discord, and WebSocket. Bridges messaging channels to tmux-based Claude sessions.
 
 USAGE:
     ccc                     Start/attach tmux session in current directory
@@ -1103,12 +1198,19 @@ COMMANDS:
     config projects-dir <path>  Set base directory for projects
     config oauth-token <token>  Set OAuth token
     setgroup                Configure Telegram group for topics (if skipped during setup)
-    listen                  Start the Telegram bot listener manually
+    listen                  Start bot listener + gateway + channels
     install                 Install Claude hook manually
     send <file>             Send file to current session's Telegram topic
+    start <name> <dir> <prompt>  Create detached session with prompt
     relay [port]            Start relay server for large files (default: 8080)
     run                     Run Claude directly (used by tmux sessions)
     hook                    Handle Claude hook (internal)
+
+SKILLS:
+    skills                  List all discovered skills
+    skills sync             Sync ClawHub skills to Claude Code
+    skills install <slug>   Install skill from ClawHub registry
+    skills search <query>   Search ClawHub for skills
 
 TELEGRAM COMMANDS:
     /new <name>             Create new session with topic (in projects_dir)
@@ -1116,6 +1218,14 @@ TELEGRAM COMMANDS:
     /new                    Restart session in current topic
     /c <cmd>                Execute shell command
     /update                 Update ccc binary from GitHub
+    /stats                  Show system stats
+    /skills                 List/sync/install skills
+
+GATEWAY:
+    WebSocket: ws://127.0.0.1:18789/ws (auth: Bearer token)
+    REST:      http://127.0.0.1:18789/sessions
+               http://127.0.0.1:18789/sessions/<name>/messages
+               http://127.0.0.1:18789/health
 
 FLAGS:
     -h, --help              Show this help
