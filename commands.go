@@ -619,6 +619,13 @@ func doctor() {
 				if strings.HasSuffix(e.Name(), ".md") {
 					count++
 				}
+				// Also count subdirectories with SKILL.md (OpenClaw format)
+				if e.IsDir() {
+					skillMD := filepath.Join(dir, e.Name(), "SKILL.md")
+					if _, err := os.Stat(skillMD); err == nil {
+						count++
+					}
+				}
 			}
 			fmt.Printf("✅ %d skills in %s\n", count, dir)
 		}

@@ -11,10 +11,11 @@ import (
 
 // SkillInfo describes a discovered skill.
 type SkillInfo struct {
-	Name   string // filename without .md extension
-	Path   string // absolute path to the skill file
-	Source string // "clawhub", "openclaw-bundled", "claude-code", "ccc"
-	Synced bool   // true if symlinked into ~/.claude/skills/
+	Name   string // skill name (directory name or filename without .md)
+	Path   string // absolute path to the skill directory or file
+	Source string // "clawhub", "openclaw-bundled", "claude-code"
+	Synced bool   // true if present in ~/.claude/skills/
+	IsDir  bool   // true if skill is a directory (with SKILL.md), false if flat .md
 }
 
 // getSkillDirs returns all directories to scan for skills.
@@ -33,15 +34,19 @@ func findBundledSkillsDir() string {
 
 	// Check common locations for OpenClaw bundled skills
 	candidates := []string{
+		// npm global install
+		filepath.Join(home, ".npm-global", "lib", "node_modules", "openclaw", "skills"),
+		// Local project
+		filepath.Join(home, "projects", "openclaw", "skills"),
+		// Various node_modules locations
 		filepath.Join(home, ".openclaw", "tools", "skills"),
 		filepath.Join(home, "node_modules", "openclaw", "skills"),
 		filepath.Join(home, "node_modules", "@openclaw", "core", "skills"),
 	}
 
-	// Also search within .openclaw directory for any node_modules skills
+	// Also search within .openclaw/node_modules
 	ocNodeModules := filepath.Join(home, ".openclaw", "node_modules")
 	if info, err := os.Stat(ocNodeModules); err == nil && info.IsDir() {
-		// Look for skills directories within openclaw packages
 		entries, _ := os.ReadDir(ocNodeModules)
 		for _, e := range entries {
 			if strings.HasPrefix(e.Name(), "openclaw") || strings.HasPrefix(e.Name(), "@openclaw") {
@@ -51,15 +56,32 @@ func findBundledSkillsDir() string {
 		}
 	}
 
+	// Also try finding via npm root
+	if out, err := exec.Command("npm", "root", "-g").Output(); err == nil {
+		globalRoot := strings.TrimSpace(string(out))
+		candidates = append(candidates, filepath.Join(globalRoot, "openclaw", "skills"))
+	}
+
 	for _, dir := range candidates {
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
-			return dir
+			// Verify it actually contains skills (subdirs with SKILL.md)
+			entries, _ := os.ReadDir(dir)
+			for _, e := range entries {
+				if e.IsDir() {
+					skillMD := filepath.Join(dir, e.Name(), "SKILL.md")
+					if _, err := os.Stat(skillMD); err == nil {
+						return dir
+					}
+				}
+			}
 		}
 	}
 	return ""
 }
 
 // scanSkills discovers all available skills across all sources.
+// OpenClaw uses subdirectory format: skills/<name>/SKILL.md
+// Claude Code supports both: skills/<name>/SKILL.md and skills/<name>.md
 func scanSkills() []SkillInfo {
 	home, _ := os.UserHomeDir()
 	claudeSkillsDir := filepath.Join(home, ".claude", "skills")
@@ -83,6 +105,35 @@ func scanSkills() []SkillInfo {
 
 		for _, entry := range entries {
 			name := entry.Name()
+
+			// Case 1: Subdirectory with SKILL.md (OpenClaw format)
+			if entry.IsDir() {
+				skillMD := filepath.Join(dir, name, "SKILL.md")
+				if _, err := os.Stat(skillMD); err != nil {
+					continue // No SKILL.md in this dir
+				}
+
+				if seen[name] {
+					continue
+				}
+				seen[name] = true
+
+				fullPath := filepath.Join(dir, name)
+
+				// Check if synced to Claude Code skills dir
+				synced := isSynced(claudeSkillsDir, name, fullPath, source == "claude-code")
+
+				skills = append(skills, SkillInfo{
+					Name:   name,
+					Path:   fullPath,
+					Source: source,
+					Synced: synced,
+					IsDir:  true,
+				})
+				continue
+			}
+
+			// Case 2: Flat .md file (Claude Code native format)
 			if !strings.HasSuffix(name, ".md") {
 				continue
 			}
@@ -94,14 +145,11 @@ func scanSkills() []SkillInfo {
 			seen[baseName] = true
 
 			fullPath := filepath.Join(dir, name)
-
-			// Check if it's synced (symlinked into claude-code skills dir)
 			synced := false
-			claudePath := filepath.Join(claudeSkillsDir, name)
-			if target, err := os.Readlink(claudePath); err == nil {
-				synced = target == fullPath
-			} else if _, err := os.Stat(claudePath); err == nil && source == "claude-code" {
-				synced = true // Native claude-code skill
+			if source == "claude-code" {
+				synced = true // Already in the right place
+			} else {
+				synced = isSynced(claudeSkillsDir, baseName, fullPath, false)
 			}
 
 			skills = append(skills, SkillInfo{
@@ -109,6 +157,7 @@ func scanSkills() []SkillInfo {
 				Path:   fullPath,
 				Source: source,
 				Synced: synced,
+				IsDir:  false,
 			})
 		}
 	}
@@ -120,7 +169,37 @@ func scanSkills() []SkillInfo {
 	return skills
 }
 
+// isSynced checks if a skill is present in the Claude Code skills directory.
+func isSynced(claudeSkillsDir, name, sourcePath string, isNative bool) bool {
+	if isNative {
+		return true
+	}
+
+	// Check for directory symlink: ~/.claude/skills/<name> -> sourcePath
+	dirLink := filepath.Join(claudeSkillsDir, name)
+	if target, err := os.Readlink(dirLink); err == nil {
+		return target == sourcePath
+	}
+	// Check if a directory exists (maybe copied, not symlinked)
+	if info, err := os.Stat(dirLink); err == nil && info.IsDir() {
+		skillMD := filepath.Join(dirLink, "SKILL.md")
+		if _, err := os.Stat(skillMD); err == nil {
+			return true
+		}
+	}
+
+	// Check for flat file symlink: ~/.claude/skills/<name>.md -> sourcePath
+	fileLink := filepath.Join(claudeSkillsDir, name+".md")
+	if target, err := os.Readlink(fileLink); err == nil {
+		return target == sourcePath
+	}
+
+	return false
+}
+
 // syncSkills creates symlinks for all non-claude-code skills into ~/.claude/skills/.
+// For directory skills (OpenClaw format), symlinks the entire directory.
+// For flat .md files, symlinks the file.
 func syncSkills() (int, int, error) {
 	home, _ := os.UserHomeDir()
 	claudeSkillsDir := filepath.Join(home, ".claude", "skills")
@@ -143,16 +222,24 @@ func syncSkills() (int, int, error) {
 			continue // Already symlinked
 		}
 
-		linkPath := filepath.Join(claudeSkillsDir, skill.Name+".md")
+		var linkPath string
+		if skill.IsDir {
+			// Symlink entire directory: ~/.claude/skills/<name> -> source/<name>/
+			linkPath = filepath.Join(claudeSkillsDir, skill.Name)
+		} else {
+			// Symlink flat file: ~/.claude/skills/<name>.md -> source/<name>.md
+			linkPath = filepath.Join(claudeSkillsDir, skill.Name+".md")
+		}
 
-		// Remove existing file/link if present
-		os.Remove(linkPath)
+		// Remove existing file/link/dir if present
+		os.RemoveAll(linkPath)
 
 		if err := os.Symlink(skill.Path, linkPath); err != nil {
 			fmt.Fprintf(os.Stderr, "skills: symlink failed for %s: %v\n", skill.Name, err)
 			continue
 		}
 
+		fmt.Printf("  ✓ %s -> %s\n", skill.Name, skill.Path)
 		synced++
 	}
 
@@ -203,15 +290,34 @@ func handleSkillsCommand(args []string) {
 		}
 
 		fmt.Printf("Found %d skill(s):\n\n", len(skills))
+
+		// Group by source
+		bySource := make(map[string][]SkillInfo)
 		for _, s := range skills {
-			syncIcon := "  "
-			if s.Synced {
-				syncIcon = "✓ "
-			}
-			fmt.Printf("  %s%-30s [%s] %s\n", syncIcon, s.Name, s.Source, s.Path)
+			bySource[s.Source] = append(bySource[s.Source], s)
 		}
 
-		fmt.Println("\n✓ = synced to Claude Code (~/.claude/skills/)")
+		for _, source := range []string{"openclaw-bundled", "clawhub", "claude-code"} {
+			group := bySource[source]
+			if len(group) == 0 {
+				continue
+			}
+			fmt.Printf("  [%s] (%d):\n", source, len(group))
+			for _, s := range group {
+				syncIcon := "  "
+				if s.Synced {
+					syncIcon = "✓ "
+				}
+				kind := "file"
+				if s.IsDir {
+					kind = "dir "
+				}
+				fmt.Printf("    %s%-25s %s  %s\n", syncIcon, s.Name, kind, s.Path)
+			}
+			fmt.Println()
+		}
+
+		fmt.Println("✓ = synced to Claude Code (~/.claude/skills/)")
 		fmt.Println("\nCommands:")
 		fmt.Println("  ccc skills sync          Sync all to Claude Code")
 		fmt.Println("  ccc skills install <slug> Install from ClawHub")
@@ -226,7 +332,7 @@ func handleSkillsCommand(args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Synced %d skill(s), skipped %d (already synced or native)\n", synced, skipped)
+		fmt.Printf("\nSynced %d skill(s), skipped %d (already synced or native)\n", synced, skipped)
 
 	case "install":
 		if len(args) < 2 {
