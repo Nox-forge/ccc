@@ -611,6 +611,53 @@ func listen() error {
 	// Start WebSocket gateway
 	startGateway(config)
 
+	// Initialize multi-channel router
+	router := NewRouter(config)
+
+	// Add Signal channel if configured
+	if isSignalConfigured(config) {
+		signalCh := NewSignalChannel(config)
+		router.AddChannel(signalCh)
+	}
+
+	// Add Discord channel if token available
+	if os.Getenv("DISCORD_BOT_TOKEN") != "" {
+		discordCh := NewDiscordChannel(config)
+		router.AddChannel(discordCh)
+	}
+
+	// Start router channels (inbound messages go to tmux via handler)
+	router.Start(func(msg InboundMessage) {
+		if msg.Session == "" || msg.Content == "" {
+			return
+		}
+		config, _ := loadConfig()
+		if config == nil {
+			return
+		}
+
+		tmuxName := sessionName(msg.Session)
+
+		// Auto-start if not running
+		if !tmuxSessionExists(tmuxName) {
+			info, exists := config.Sessions[msg.Session]
+			if !exists {
+				return
+			}
+			if _, err := os.Stat(info.Path); os.IsNotExist(err) {
+				os.MkdirAll(info.Path, 0755)
+			}
+			createTmuxSession(tmuxName, info.Path, false)
+			time.Sleep(3 * time.Second)
+		}
+
+		// Persist and send
+		persistMessage(msg.Session, "user", msg.Content, msg.Channel)
+		sendToTmux(tmuxName, msg.Content)
+	})
+
+	defer router.Stop()
+
 	setBotCommands(config.BotToken)
 
 	sigChan := make(chan os.Signal, 1)
