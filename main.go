@@ -14,6 +14,7 @@ type SessionInfo struct {
 	TopicID         int64  `json:"topic_id"`
 	Path            string `json:"path"`
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
+	SignalNumber    string `json:"signal_number,omitempty"` // Signal recipient for this session
 }
 
 // Config stores bot configuration and session mappings
@@ -368,6 +369,9 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+
+	case "skills":
+		handleSkillsCommand(os.Args[2:])
 
 	case "relay":
 		port := "8080"

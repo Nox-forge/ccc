@@ -100,6 +100,9 @@ func handleHook() error {
 		persistSnapshot(sessionName, hookData.TranscriptPath)
 	}
 
+	// Notify gateway
+	notifyGateway(sessionName, "assistant", lastMessage, "stop")
+
 	// Always send the Stop message (final result)
 	err = sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
 
@@ -392,8 +395,9 @@ func handleOutputHook() error {
 						if strings.TrimSpace(string(lastSent)) != strings.TrimSpace(msg) {
 							os.WriteFile(cacheFile, []byte(msg), 0600)
 							editMessage(config, config.GroupID, msgID, topicID, msg)
-							// Persist the updated assistant message
+							// Persist and notify gateway
 							persistMessage(sessionName, "assistant", msg, "claude")
+							notifyGateway(sessionName, "assistant", msg, "message")
 						}
 						return nil
 					}
@@ -407,8 +411,9 @@ func handleOutputHook() error {
 			}
 			os.WriteFile(cacheFile, []byte(msg), 0600)
 
-			// Persist assistant message
+			// Persist assistant message and notify gateway
 			persistMessage(sessionName, "assistant", msg, "claude")
+			notifyGateway(sessionName, "assistant", msg, "message")
 
 			// Add tool name prefix for PreToolUse
 			finalMsg := msg

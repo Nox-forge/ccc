@@ -603,6 +603,14 @@ func listen() error {
 	fmt.Printf("Active sessions: %d\n", len(config.Sessions))
 	fmt.Println("Press Ctrl+C to stop")
 
+	// Initialize persistence store
+	if err := initStore(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: persistence store init failed: %v\n", err)
+	}
+
+	// Start WebSocket gateway
+	startGateway(config)
+
 	setBotCommands(config.BotToken)
 
 	sigChan := make(chan os.Signal, 1)
@@ -831,6 +839,49 @@ func listen() error {
 			if text == "/stats" {
 				stats := getSystemStats()
 				sendMessage(config, chatID, threadID, stats)
+				continue
+			}
+
+			if strings.HasPrefix(text, "/skills") {
+				arg := strings.TrimSpace(strings.TrimPrefix(text, "/skills"))
+				if arg == "" {
+					// List skills
+					skills := scanSkills()
+					if len(skills) == 0 {
+						sendMessage(config, chatID, threadID, "No skills found. Use `/skills sync` or `/skills install <slug>`")
+					} else {
+						var sb strings.Builder
+						sb.WriteString(fmt.Sprintf("📚 %d skill(s):\n\n", len(skills)))
+						for _, s := range skills {
+							icon := "⬜"
+							if s.Synced {
+								icon = "✅"
+							}
+							sb.WriteString(fmt.Sprintf("%s %s [%s]\n", icon, s.Name, s.Source))
+						}
+						sendMessage(config, chatID, threadID, sb.String())
+					}
+				} else if arg == "sync" {
+					synced, skipped, err := syncSkills()
+					if err != nil {
+						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Sync error: %v", err))
+					} else {
+						sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Synced %d, skipped %d", synced, skipped))
+					}
+				} else if strings.HasPrefix(arg, "install ") {
+					slug := strings.TrimPrefix(arg, "install ")
+					sendMessage(config, chatID, threadID, fmt.Sprintf("📦 Installing %s...", slug))
+					go func() {
+						defer func() { recover() }()
+						if err := installSkillFromHub(slug); err != nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Install failed: %v", err))
+						} else {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Installed: %s", slug))
+						}
+					}()
+				} else {
+					sendMessage(config, chatID, threadID, "Usage: /skills, /skills sync, /skills install <slug>")
+				}
 				continue
 			}
 
