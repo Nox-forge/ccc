@@ -6,11 +6,39 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
+
+const (
+	imageWarnThreshold    = 70
+	imageCompactThreshold = 90
+	imageCompactCooldown  = 5 * time.Minute
+	imageWarnCooldown     = 10 * time.Minute
+)
+
+// sendSignalMessage sends a message via Signal using send-signal script.
+// It's fire-and-forget (runs in goroutine, errors logged to stderr).
+func sendSignalMessage(signalNumber string, message string) {
+	go func() {
+		defer func() { recover() }()
+		cmd := exec.Command("send-signal", message, signalNumber)
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "signal: send failed: %v\n", err)
+		}
+	}()
+}
+
+// getSignalNumber returns the signal_number for a session, or empty string
+func getSignalNumber(config *Config, sessionName string) string {
+	if info, ok := config.Sessions[sessionName]; ok && info != nil {
+		return info.SignalNumber
+	}
+	return ""
+}
 
 func handleHook() error {
 	config, err := loadConfig()
@@ -64,8 +92,23 @@ func handleHook() error {
 	msgIDFile := filepath.Join(os.TempDir(), "ccc-msgid-"+sessionName)
 	os.Remove(msgIDFile)
 
+	// Persist final assistant message
+	persistMessage(sessionName, "assistant", lastMessage, "claude")
+
+	// Save a context snapshot on session stop
+	if hookData.TranscriptPath != "" {
+		persistSnapshot(sessionName, hookData.TranscriptPath)
+	}
+
 	// Always send the Stop message (final result)
-	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
+	err = sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
+
+	// Also send via Signal if configured
+	if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+		sendSignalMessage(sigNum, fmt.Sprintf("[%s] Done: %s", sessionName, lastMessage))
+	}
+
+	return err
 }
 
 func handlePermissionHook() error {
@@ -157,6 +200,17 @@ func handlePermissionHook() error {
 				if len(buttons) > 0 {
 					sendMessageWithKeyboard(config, config.GroupID, topicID, msg, buttons)
 				}
+
+				// Also send via Signal if configured
+				if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+					sigMsg := fmt.Sprintf("[%s] %s\n%s", sessionName, q.Header, q.Question)
+					for _, opt := range q.Options {
+						if opt.Label != "" {
+							sigMsg += fmt.Sprintf("\n• %s", opt.Label)
+						}
+					}
+					sendSignalMessage(sigNum, sigMsg)
+				}
 			}
 		}()
 		return nil
@@ -168,6 +222,10 @@ func handlePermissionHook() error {
 		if hookData.ToolName != "" {
 			msg := fmt.Sprintf("🔐 Permission requested: %s", hookData.ToolName)
 			sendMessage(config, config.GroupID, topicID, msg)
+			// Also send via Signal if configured
+			if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+				sendSignalMessage(sigNum, fmt.Sprintf("[%s] Permission requested: %s", sessionName, hookData.ToolName))
+			}
 		}
 	}()
 
@@ -191,6 +249,10 @@ func getLastAssistantMessage(transcriptPath string) string {
 		var entry map[string]interface{}
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			continue
+		}
+		// Reset on user messages so we only return text from the current turn
+		if entry["type"] == "user" {
+			lastMessage = ""
 		}
 		if entry["type"] == "assistant" {
 			if msg, ok := entry["message"].(map[string]interface{}); ok {
@@ -250,6 +312,11 @@ func handlePromptHook() error {
 		return nil
 	}
 
+	// Persist user prompt
+	if sessionName != "" {
+		persistMessage(sessionName, "user", hookData.Prompt, "claude")
+	}
+
 	// Cache the current last assistant message to prevent re-sending old messages
 	if sessionName != "" && hookData.TranscriptPath != "" {
 		if msg := getLastAssistantMessage(hookData.TranscriptPath); msg != "" {
@@ -263,7 +330,16 @@ func handlePromptHook() error {
 
 	// Send the prompt to Telegram (sendMessage handles splitting long messages)
 	fmt.Fprintf(os.Stderr, "hook-prompt: sending to topic %d\n", topicID)
-	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("💬 %s", hookData.Prompt))
+	err = sendMessage(config, config.GroupID, topicID, fmt.Sprintf("💬 %s", hookData.Prompt))
+
+	// Also send via Signal if configured
+	if sessionName != "" {
+		if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+			sendSignalMessage(sigNum, fmt.Sprintf("[%s] Prompt: %s", sessionName, hookData.Prompt))
+		}
+	}
+
+	return err
 }
 
 func handleOutputHook() error {
@@ -316,6 +392,8 @@ func handleOutputHook() error {
 						if strings.TrimSpace(string(lastSent)) != strings.TrimSpace(msg) {
 							os.WriteFile(cacheFile, []byte(msg), 0600)
 							editMessage(config, config.GroupID, msgID, topicID, msg)
+							// Persist the updated assistant message
+							persistMessage(sessionName, "assistant", msg, "claude")
 						}
 						return nil
 					}
@@ -329,6 +407,9 @@ func handleOutputHook() error {
 			}
 			os.WriteFile(cacheFile, []byte(msg), 0600)
 
+			// Persist assistant message
+			persistMessage(sessionName, "assistant", msg, "claude")
+
 			// Add tool name prefix for PreToolUse
 			finalMsg := msg
 			if hookData.HookEventName == "PreToolUse" && hookData.ToolName != "" {
@@ -341,7 +422,138 @@ func handleOutputHook() error {
 		}
 	}
 
+	// Check image count on PostToolUse (async, don't block hook)
+	if hookData.HookEventName == "PostToolUse" && hookData.TranscriptPath != "" {
+		go checkImageCount(config, sessionName, topicID, hookData.TranscriptPath)
+	}
+
+	// Also send latest output via Signal if configured (only on PostToolUse to avoid spam)
+	if hookData.HookEventName == "PostToolUse" {
+		if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+			if hookData.TranscriptPath != "" {
+				if msg := getLastAssistantMessage(hookData.TranscriptPath); msg != "" {
+					sendSignalMessage(sigNum, fmt.Sprintf("[%s] %s", sessionName, msg))
+				}
+			}
+		}
+	}
+
 	return nil
+}
+
+// countImagesInTranscript counts base64 image blocks in the transcript
+// after the last compact/summary event. Also returns whether the transcript
+// contains any summary entries (indicating a compact has occurred).
+func countImagesInTranscript(transcriptPath string) (int, bool) {
+	if transcriptPath == "" {
+		return 0, false
+	}
+
+	file, err := os.Open(transcriptPath)
+	if err != nil {
+		return 0, false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
+	imageCount := 0
+	hasSummary := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Reset count on compact/summary (images before compact are no longer in context)
+		if strings.Contains(line, `"type":"summary"`) {
+			imageCount = 0
+			hasSummary = true
+		}
+
+		// Count base64 image blocks (each represents one image in the API request)
+		imageCount += strings.Count(line, `"type":"base64"`)
+	}
+
+	return imageCount, hasSummary
+}
+
+// checkImageCount checks the image count and warns or auto-compacts.
+// It also detects compact events and saves context snapshots.
+func checkImageCount(config *Config, sName string, topicID int64, transcriptPath string) {
+	defer func() { recover() }()
+
+	imageCount, hasSummary := countImagesInTranscript(transcriptPath)
+
+	// If a summary exists, try to persist a snapshot (idempotent via cooldown)
+	if hasSummary {
+		snapshotCooldownFile := filepath.Join(os.TempDir(), "ccc-snapshot-"+sName)
+		info, err := os.Stat(snapshotCooldownFile)
+		if err != nil || time.Since(info.ModTime()) > 2*time.Minute {
+			os.WriteFile(snapshotCooldownFile, []byte("1"), 0600)
+			persistSnapshot(sName, transcriptPath)
+		}
+	}
+
+	if imageCount == 0 {
+		return
+	}
+
+	if imageCount >= imageCompactThreshold {
+		// Check cooldown to prevent repeated compacts
+		cooldownFile := filepath.Join(os.TempDir(), "ccc-compact-"+sName)
+		if info, err := os.Stat(cooldownFile); err == nil {
+			if time.Since(info.ModTime()) < imageCompactCooldown {
+				return
+			}
+		}
+		os.WriteFile(cooldownFile, []byte(fmt.Sprintf("%d", imageCount)), 0600)
+		autoCompact(config, sName, topicID, imageCount)
+	} else if imageCount >= imageWarnThreshold {
+		// Warn with cooldown to avoid spam
+		warnFile := filepath.Join(os.TempDir(), "ccc-imgwarn-"+sName)
+		if info, err := os.Stat(warnFile); err == nil {
+			if time.Since(info.ModTime()) < imageWarnCooldown {
+				return
+			}
+		}
+		os.WriteFile(warnFile, []byte(fmt.Sprintf("%d", imageCount)), 0600)
+		sendMessage(config, config.GroupID, topicID,
+			fmt.Sprintf("⚠️ Image count: %d/100. Will auto-compact at %d.", imageCount, imageCompactThreshold))
+	}
+}
+
+// autoCompact interrupts the current Claude session and runs /compact
+func autoCompact(config *Config, sName string, topicID int64, imageCount int) {
+	tmuxName := "claude-" + strings.ReplaceAll(sName, ".", "_")
+
+	if !tmuxSessionExists(tmuxName) {
+		return
+	}
+
+	sendMessage(config, config.GroupID, topicID,
+		fmt.Sprintf("⚠️ Auto-compacting: %d/100 images in context", imageCount))
+
+	// Interrupt current operation
+	exec.Command(tmuxPath, "send-keys", "-t", tmuxName, "Escape").Run()
+	time.Sleep(300 * time.Millisecond)
+	exec.Command(tmuxPath, "send-keys", "-t", tmuxName, "C-c").Run()
+
+	// Wait for Claude to return to prompt
+	if err := waitForClaude(tmuxName, 15*time.Second); err != nil {
+		sendMessage(config, config.GroupID, topicID, "⚠️ Auto-compact: could not reach prompt, skipping")
+		return
+	}
+
+	// Send /compact command
+	exec.Command(tmuxPath, "send-keys", "-t", tmuxName, "-l", "/compact").Run()
+	time.Sleep(1 * time.Second)
+	exec.Command(tmuxPath, "send-keys", "-t", tmuxName, "Enter").Run()
+
+	// Wait for compact to complete
+	time.Sleep(15 * time.Second)
+
+	sendMessage(config, config.GroupID, topicID, "✅ Auto-compact completed. Image context cleared.")
 }
 
 func handleQuestionHook() error {
@@ -379,7 +591,7 @@ func handleQuestionHook() error {
 		return nil
 	}
 
-	// Send questions to Telegram
+	// Send questions to Telegram and Signal
 	for qIdx, q := range hookData.ToolInput.Questions {
 		if q.Question == "" {
 			continue
@@ -406,9 +618,86 @@ func handleQuestionHook() error {
 		} else {
 			sendMessage(config, config.GroupID, topicID, msg)
 		}
+
+		// Also send via Signal if configured
+		if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+			sigMsg := fmt.Sprintf("[%s] %s\n%s", sessionName, q.Header, q.Question)
+			for _, opt := range q.Options {
+				if opt.Label != "" {
+					sigMsg += fmt.Sprintf("\n• %s", opt.Label)
+				}
+			}
+			sendSignalMessage(sigNum, sigMsg)
+		}
 	}
 
 	return nil
+}
+
+// persistMessage saves a message to the store (fire-and-forget, never blocks hooks).
+func persistMessage(session, role, content, channel string) {
+	go func() {
+		defer func() { recover() }()
+		if err := initStore(); err != nil {
+			fmt.Fprintf(os.Stderr, "persist: store init error: %v\n", err)
+			return
+		}
+		if err := store.SaveMessage(session, role, content, channel); err != nil {
+			fmt.Fprintf(os.Stderr, "persist: save error: %v\n", err)
+		}
+	}()
+}
+
+// persistSnapshot saves a context snapshot from a compact event.
+func persistSnapshot(session, transcriptPath string) {
+	go func() {
+		defer func() { recover() }()
+		if err := initStore(); err != nil {
+			fmt.Fprintf(os.Stderr, "persist: store init error: %v\n", err)
+			return
+		}
+		// Extract the summary from the transcript (the text after the last "type":"summary" entry)
+		summary := getCompactSummary(transcriptPath)
+		if summary == "" {
+			summary = "Context compacted (no summary extracted)"
+		}
+		if err := store.SaveSnapshot(session, summary); err != nil {
+			fmt.Fprintf(os.Stderr, "persist: snapshot error: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "persist: snapshot saved for session %s (%d bytes)\n", session, len(summary))
+		}
+	}()
+}
+
+// getCompactSummary extracts the summary text from the last compact/summary entry in the transcript.
+func getCompactSummary(transcriptPath string) string {
+	if transcriptPath == "" {
+		return ""
+	}
+
+	file, err := os.Open(transcriptPath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
+	var lastSummary string
+	for scanner.Scan() {
+		var entry map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		if entry["type"] == "summary" {
+			if msg, ok := entry["summary"].(string); ok && msg != "" {
+				lastSummary = msg
+			}
+		}
+	}
+	return lastSummary
 }
 
 func handleNotificationHook() error {
@@ -432,6 +721,7 @@ func handleNotificationHook() error {
 	}
 
 	// Find session by matching cwd with saved path
+	var sessionName string
 	var topicID int64
 	for name, info := range config.Sessions {
 		if info == nil {
@@ -439,6 +729,7 @@ func handleNotificationHook() error {
 		}
 		// Match against saved path, subdirectories of saved path, or suffix
 		if hookData.Cwd == info.Path || strings.HasPrefix(hookData.Cwd, info.Path+"/") || strings.HasSuffix(hookData.Cwd, "/"+name) {
+			sessionName = name
 			topicID = info.TopicID
 			break
 		}
@@ -448,7 +739,14 @@ func handleNotificationHook() error {
 		return nil
 	}
 
-	return sendMessage(config, config.GroupID, topicID, fmt.Sprintf("🔔 %s", hookData.Notification))
+	err = sendMessage(config, config.GroupID, topicID, fmt.Sprintf("🔔 %s", hookData.Notification))
+
+	// Also send via Signal if configured
+	if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+		sendSignalMessage(sigNum, fmt.Sprintf("[%s] %s", sessionName, hookData.Notification))
+	}
+
+	return err
 }
 
 // isCccHook checks if a hook entry contains a ccc command
