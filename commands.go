@@ -596,14 +596,43 @@ func doctor() {
 	fmt.Println("📚 Skills")
 
 	skills := scanSkills()
+	enrichSkills(skills, config)
 	fmt.Printf("total skills...... %d\n", len(skills))
 	syncedCount := 0
+	readyCount := 0
+	needBinsCount := 0
+	needEnvCount := 0
+	needConfigCount := 0
+	osSkipCount := 0
+	baseDirCount := 0
 	for _, s := range skills {
 		if s.Synced {
 			syncedCount++
 		}
+		if s.Readiness != nil {
+			if s.Readiness.Ready {
+				readyCount++
+			}
+			if !s.Readiness.OSCompatible {
+				osSkipCount++
+			} else if len(s.Readiness.MissingBins) > 0 {
+				needBinsCount++
+			} else if len(s.Readiness.MissingEnv) > 0 {
+				needEnvCount++
+			} else if len(s.Readiness.MissingConfig) > 0 {
+				needConfigCount++
+			}
+			if s.Readiness.HasBaseDir {
+				baseDirCount++
+			}
+		}
 	}
 	fmt.Printf("synced to claude.. %d\n", syncedCount)
+	fmt.Printf("readiness......... ✅ %d ready, 📦 %d need bins, 🔑 %d need env, ⚙️ %d need config, ⏭ %d OS-skip\n",
+		readyCount, needBinsCount, needEnvCount, needConfigCount, osSkipCount)
+	if baseDirCount > 0 {
+		fmt.Printf("baseDir skills.... %d (resolved during sync)\n", baseDirCount)
+	}
 
 	skillsDirs := getSkillDirs()
 	for source, dir := range skillsDirs {
@@ -1009,13 +1038,69 @@ func listen() error {
 						}
 						sendMessage(config, chatID, threadID, sb.String())
 					}
-				} else if arg == "sync" {
-					synced, skipped, err := syncSkills()
+				} else if arg == "check" {
+					skills := scanSkills()
+					enrichSkills(skills, config)
+					ready, needDeps, needEnv, needCfg, osIncompat := 0, 0, 0, 0, 0
+					var sb strings.Builder
+					sb.WriteString(fmt.Sprintf("📚 Skill Readiness (%d skills, %s):\n\n", len(skills), currentOSLabel()))
+					for _, s := range skills {
+						if s.Readiness == nil {
+							continue
+						}
+						r := s.Readiness
+						emoji := ""
+						if s.Meta != nil && s.Meta.Metadata != nil && s.Meta.Metadata.Emoji != "" {
+							emoji = s.Meta.Metadata.Emoji + " "
+						}
+						if !r.OSCompatible {
+							sb.WriteString(fmt.Sprintf("⏭ %s%s\n", emoji, s.Name))
+							osIncompat++
+						} else if len(r.MissingConfig) > 0 {
+							sb.WriteString(fmt.Sprintf("⚙️ %s%s\n", emoji, s.Name))
+							needCfg++
+						} else if len(r.MissingEnv) > 0 {
+							sb.WriteString(fmt.Sprintf("🔑 %s%s\n", emoji, s.Name))
+							needEnv++
+						} else if len(r.MissingBins) > 0 {
+							sb.WriteString(fmt.Sprintf("📦 %s%s\n", emoji, s.Name))
+							needDeps++
+						} else {
+							sb.WriteString(fmt.Sprintf("✅ %s%s\n", emoji, s.Name))
+							ready++
+						}
+					}
+					sb.WriteString(fmt.Sprintf("\n%d ready, %d need bins, %d need env, %d need config, %d OS-skip", ready, needDeps, needEnv, needCfg, osIncompat))
+					sendMessage(config, chatID, threadID, sb.String())
+				} else if arg == "sync" || arg == "sync --all" {
+					forceAll := strings.Contains(arg, "--all")
+					synced, skipped, excluded, err := syncSkills(forceAll)
 					if err != nil {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Sync error: %v", err))
 					} else {
-						sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Synced %d, skipped %d", synced, skipped))
+						msg := fmt.Sprintf("✅ Synced %d, skipped %d", synced, skipped)
+						if excluded > 0 {
+							msg += fmt.Sprintf(", excluded %d (OS)", excluded)
+						}
+						sendMessage(config, chatID, threadID, msg)
 					}
+				} else if strings.HasPrefix(arg, "install-deps ") {
+					name := strings.TrimPrefix(arg, "install-deps ")
+					sendMessage(config, chatID, threadID, fmt.Sprintf("📦 Installing deps for %s...", name))
+					go func() {
+						defer func() { recover() }()
+						actions, err := installSkillDeps(name)
+						var sb strings.Builder
+						for _, a := range actions {
+							sb.WriteString(fmt.Sprintf("  %s\n", a))
+						}
+						if err != nil {
+							sb.WriteString(fmt.Sprintf("❌ %v", err))
+						} else {
+							sb.WriteString("✅ Done")
+						}
+						sendMessage(config, chatID, threadID, sb.String())
+					}()
 				} else if strings.HasPrefix(arg, "install ") {
 					slug := strings.TrimPrefix(arg, "install ")
 					sendMessage(config, chatID, threadID, fmt.Sprintf("📦 Installing %s...", slug))
@@ -1028,7 +1113,7 @@ func listen() error {
 						}
 					}()
 				} else {
-					sendMessage(config, chatID, threadID, "Usage: /skills, /skills sync, /skills install <slug>")
+					sendMessage(config, chatID, threadID, "Usage: /skills, /skills check, /skills sync [--all], /skills install <slug>, /skills install-deps <name>")
 				}
 				continue
 			}
@@ -1215,8 +1300,10 @@ COMMANDS:
 
 SKILLS:
     skills                  List all discovered skills
-    skills sync             Sync ClawHub skills to Claude Code
+    skills check            Check readiness per skill (OS, bins, env, config)
+    skills sync [--all]     Sync skills to Claude Code (--all includes OS-incompatible)
     skills install <slug>   Install skill from ClawHub registry
+    skills install-deps <name>  Install missing deps for a skill
     skills search <query>   Search ClawHub for skills
 
 TELEGRAM COMMANDS:
@@ -1226,7 +1313,7 @@ TELEGRAM COMMANDS:
     /c <cmd>                Execute shell command
     /update                 Update ccc binary from GitHub
     /stats                  Show system stats
-    /skills                 List/sync/install skills
+    /skills                 List/sync/install/check skills
 
 GATEWAY:
     WebSocket: ws://127.0.0.1:18789/ws (auth: Bearer token)
