@@ -282,9 +282,10 @@ func (g *Gateway) handleIncomingMessage(client *wsClient, msg *GatewayMessage) {
 		time.Sleep(3 * time.Second)
 	}
 
-	// Persist and send to tmux
+	// Persist original, enrich before sending to Claude
 	persistMessage(msg.Session, "user", msg.Content, "websocket")
-	if err := sendToTmux(tmuxName, msg.Content); err != nil {
+	enriched := enrichMessage(msg.Content)
+	if err := sendToTmux(tmuxName, enriched); err != nil {
 		g.sendError(client, fmt.Sprintf("failed to send to tmux: %v", err))
 		return
 	}

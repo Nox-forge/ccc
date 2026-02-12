@@ -781,9 +781,10 @@ func listen() error {
 			time.Sleep(3 * time.Second)
 		}
 
-		// Persist and send
+		// Persist original, enrich before sending to Claude
 		persistMessage(msg.Session, "user", msg.Content, msg.Channel)
-		sendToTmux(tmuxName, msg.Content)
+		enriched := enrichMessage(msg.Content)
+		sendToTmux(tmuxName, enriched)
 	})
 
 	defer router.Stop()
