@@ -94,17 +94,38 @@ func updateCCC(config *Config, chatID, threadID int64) {
 }
 
 func telegramAPI(config *Config, method string, params url.Values) (*TelegramResponse, error) {
-	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/%s", config.BotToken, method)
-	resp, err := http.PostForm(apiURL, params)
-	if err != nil {
-		return nil, redactTokenError(err, config.BotToken)
-	}
-	defer resp.Body.Close()
+	const maxRetries = 3
+	apiURL := fmt.Sprintf("%s/bot%s/%s", TelegramAPIBase(config), config.BotToken, method)
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-	var result TelegramResponse
-	json.Unmarshal(body, &result)
-	return &result, nil
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		resp, err := http.PostForm(apiURL, params)
+		if err != nil {
+			return nil, redactTokenError(err, config.BotToken)
+		}
+
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
+		resp.Body.Close()
+
+		var result TelegramResponse
+		json.Unmarshal(body, &result)
+
+		// Handle rate limiting (HTTP 429)
+		if resp.StatusCode == 429 && attempt < maxRetries {
+			retryAfter := 1 // default 1 second
+			if result.Parameters != nil && result.Parameters.RetryAfter > 0 {
+				retryAfter = result.Parameters.RetryAfter
+			}
+			hookLog("telegram 429 rate limited on %s, retrying after %ds (attempt %d/%d)",
+				method, retryAfter, attempt+1, maxRetries)
+			time.Sleep(time.Duration(retryAfter) * time.Second)
+			continue
+		}
+
+		return &result, nil
+	}
+
+	// Should not reach here, but just in case
+	return nil, fmt.Errorf("telegram API %s: max retries exceeded", method)
 }
 
 func sendMessage(config *Config, chatID int64, threadID int64, text string) error {
@@ -317,7 +338,7 @@ func sendFile(config *Config, chatID int64, threadID int64, filePath string, cap
 	writer.Close()
 
 	resp, err := http.Post(
-		fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", config.BotToken),
+		fmt.Sprintf("%s/bot%s/sendDocument", TelegramAPIBase(config), config.BotToken),
 		writer.FormDataContentType(),
 		body,
 	)
@@ -337,7 +358,7 @@ func sendFile(config *Config, chatID int64, threadID int64, filePath string, cap
 // downloadTelegramFile downloads a file from Telegram
 func downloadTelegramFile(config *Config, fileID string, destPath string) error {
 	// Get file path from Telegram
-	resp, err := telegramGet(config.BotToken, fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", config.BotToken, fileID))
+	resp, err := telegramGet(config.BotToken, fmt.Sprintf("%s/bot%s/getFile?file_id=%s", TelegramAPIBase(config), config.BotToken, fileID))
 	if err != nil {
 		return err
 	}
@@ -357,7 +378,7 @@ func downloadTelegramFile(config *Config, fileID string, destPath string) error 
 	}
 
 	// Download the file
-	fileURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", config.BotToken, result.Result.FilePath)
+	fileURL := fmt.Sprintf("%s/file/bot%s/%s", TelegramAPIBase(config), config.BotToken, result.Result.FilePath)
 	fileResp, err := telegramGet(config.BotToken, fileURL)
 	if err != nil {
 		return err
@@ -413,7 +434,7 @@ func setBotCommands(botToken string) {
 	}`
 
 	resp, err := http.Post(
-		fmt.Sprintf("https://api.telegram.org/bot%s/setMyCommands", botToken),
+		fmt.Sprintf("%s/bot%s/setMyCommands", TelegramAPIBase(nil), botToken),
 		"application/json",
 		strings.NewReader(commands),
 	)

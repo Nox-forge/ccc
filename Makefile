@@ -1,9 +1,11 @@
 .PHONY: build install clean deps
 
 PREFIX := $(CURDIR)/build/whisper
+FFMPEG_DIR := $(CURDIR)/build/ffmpeg
 BUILD_DIR := $(CURDIR)/build/cmake
 UNAME := $(shell uname)
 PC_DIR := $(PREFIX)/lib/pkgconfig
+FFMPEG_PC_DIR := $(FFMPEG_DIR)/lib/pkgconfig
 
 # Build whisper.cpp C library
 deps:
@@ -31,7 +33,7 @@ deps:
 	fi
 
 build: deps
-	PKG_CONFIG_PATH="$(PC_DIR)" CGO_LDFLAGS_ALLOW="-(W|D).*" \
+	PKG_CONFIG_PATH="$(PC_DIR):$(FFMPEG_PC_DIR)" CGO_LDFLAGS_ALLOW="-(W|D).*" \
 		go build -o ccc
 	@if [ "$(UNAME)" = "Darwin" ]; then \
 		codesign -f -s - ccc 2>/dev/null || true; \

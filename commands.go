@@ -208,7 +208,7 @@ func setup(botToken string) error {
 
 	offset := 0
 	for {
-		resp, err := telegramGet(botToken, fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", botToken, offset))
+		resp, err := telegramGet(botToken, fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=30", TelegramAPIBase(nil), botToken, offset))
 		if err != nil {
 			return fmt.Errorf("failed to get updates: %w", err)
 		}
@@ -254,7 +254,7 @@ step2:
 	deadline := time.Now().Add(30 * time.Second)
 
 	for time.Now().Before(deadline) {
-		reqURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=5", config.BotToken, offset)
+		reqURL := fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=5", TelegramAPIBase(config), config.BotToken, offset)
 		resp, err := telegramClientGet(client, config.BotToken, reqURL)
 		if err != nil {
 			continue
@@ -331,7 +331,7 @@ func setGroup(config *Config) error {
 	client := &http.Client{Timeout: 35 * time.Second}
 
 	for {
-		reqURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", config.BotToken, offset)
+		reqURL := fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=30", TelegramAPIBase(config), config.BotToken, offset)
 		resp, err := telegramClientGet(client, config.BotToken, reqURL)
 		if err != nil {
 			return err
@@ -530,6 +530,136 @@ func doctor() {
 		fmt.Println("⚠️  not set (optional)")
 	}
 
+	// --- Gateway checks ---
+	fmt.Println()
+	fmt.Println("🌐 Gateway")
+
+	fmt.Print("persistence db.... ")
+	dbPath := getDBPath()
+	if _, err := os.Stat(dbPath); err == nil {
+		if err := initStore(); err == nil {
+			result, err := store.CheckIntegrity()
+			if err == nil && result == "ok" {
+				stats, _ := store.Stats()
+				fmt.Printf("✅ %s (%d sessions, %d messages, %d snapshots)\n",
+					dbPath, stats["sessions"], stats["messages"], stats["snapshots"])
+			} else {
+				fmt.Printf("⚠️  integrity check: %s (err: %v)\n", result, err)
+			}
+		} else {
+			fmt.Printf("⚠️  open error: %v\n", err)
+		}
+	} else {
+		fmt.Println("⚠️  not created yet (will be created on first use)")
+	}
+
+	fmt.Print("gateway port...... ")
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", gatewayWSPort))
+	if err == nil {
+		resp.Body.Close()
+		fmt.Printf("✅ listening on :%d\n", gatewayWSPort)
+	} else {
+		fmt.Printf("⚠️  not running (start with: ccc listen)\n")
+	}
+
+	// --- Channel checks ---
+	fmt.Println()
+	fmt.Println("📡 Channels")
+
+	fmt.Print("signal-cli........ ")
+	if cliPath := findSignalCLI(); cliPath != "" {
+		fmt.Printf("✅ %s\n", cliPath)
+		if isSignalConfigured(config) {
+			sigCount := 0
+			for _, info := range config.Sessions {
+				if info != nil && info.SignalNumber != "" {
+					sigCount++
+				}
+			}
+			fmt.Printf("  sessions........ ✅ %d with signal numbers\n", sigCount)
+		} else {
+			fmt.Println("  sessions........ ⚠️  no sessions have signal_number configured")
+		}
+	} else {
+		fmt.Println("⚠️  not found (optional)")
+	}
+
+	fmt.Print("discord........... ")
+	if os.Getenv("DISCORD_BOT_TOKEN") != "" {
+		fmt.Println("✅ bot token set")
+	} else {
+		fmt.Println("⚠️  DISCORD_BOT_TOKEN not set (optional)")
+	}
+
+	// --- Skills checks ---
+	fmt.Println()
+	fmt.Println("📚 Skills")
+
+	skills := scanSkills()
+	enrichSkills(skills, config)
+	fmt.Printf("total skills...... %d\n", len(skills))
+	syncedCount := 0
+	readyCount := 0
+	needBinsCount := 0
+	needEnvCount := 0
+	needConfigCount := 0
+	osSkipCount := 0
+	baseDirCount := 0
+	for _, s := range skills {
+		if s.Synced {
+			syncedCount++
+		}
+		if s.Readiness != nil {
+			if s.Readiness.Ready {
+				readyCount++
+			}
+			if !s.Readiness.OSCompatible {
+				osSkipCount++
+			} else if len(s.Readiness.MissingBins) > 0 {
+				needBinsCount++
+			} else if len(s.Readiness.MissingEnv) > 0 {
+				needEnvCount++
+			} else if len(s.Readiness.MissingConfig) > 0 {
+				needConfigCount++
+			}
+			if s.Readiness.HasBaseDir {
+				baseDirCount++
+			}
+		}
+	}
+	fmt.Printf("synced to claude.. %d\n", syncedCount)
+	fmt.Printf("readiness......... ✅ %d ready, 📦 %d need bins, 🔑 %d need env, ⚙️ %d need config, ⏭ %d OS-skip\n",
+		readyCount, needBinsCount, needEnvCount, needConfigCount, osSkipCount)
+	if baseDirCount > 0 {
+		fmt.Printf("baseDir skills.... %d (resolved during sync)\n", baseDirCount)
+	}
+
+	skillsDirs := getSkillDirs()
+	for source, dir := range skillsDirs {
+		fmt.Printf("  %-14s.. ", source)
+		if dir == "" {
+			fmt.Println("not found")
+		} else if _, err := os.Stat(dir); err != nil {
+			fmt.Println("not found")
+		} else {
+			entries, _ := os.ReadDir(dir)
+			count := 0
+			for _, e := range entries {
+				if strings.HasSuffix(e.Name(), ".md") {
+					count++
+				}
+				// Also count subdirectories with SKILL.md (OpenClaw format)
+				if e.IsDir() {
+					skillMD := filepath.Join(dir, e.Name(), "SKILL.md")
+					if _, err := os.Stat(skillMD); err == nil {
+						count++
+					}
+				}
+			}
+			fmt.Printf("✅ %d skills in %s\n", count, dir)
+		}
+	}
+
 	fmt.Println()
 	if allGood {
 		fmt.Println("✅ All checks passed!")
@@ -603,6 +733,62 @@ func listen() error {
 	fmt.Printf("Active sessions: %d\n", len(config.Sessions))
 	fmt.Println("Press Ctrl+C to stop")
 
+	// Initialize persistence store
+	if err := initStore(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: persistence store init failed: %v\n", err)
+	}
+
+	// Start WebSocket gateway
+	startGateway(config)
+
+	// Initialize multi-channel router
+	router := NewRouter(config)
+
+	// Add Signal channel if configured
+	if isSignalConfigured(config) {
+		signalCh := NewSignalChannel(config)
+		router.AddChannel(signalCh)
+	}
+
+	// Add Discord channel if token available
+	if os.Getenv("DISCORD_BOT_TOKEN") != "" {
+		discordCh := NewDiscordChannel(config)
+		router.AddChannel(discordCh)
+	}
+
+	// Start router channels (inbound messages go to tmux via handler)
+	router.Start(func(msg InboundMessage) {
+		if msg.Session == "" || msg.Content == "" {
+			return
+		}
+		config, _ := loadConfig()
+		if config == nil {
+			return
+		}
+
+		tmuxName := sessionName(msg.Session)
+
+		// Auto-start if not running
+		if !tmuxSessionExists(tmuxName) {
+			info, exists := config.Sessions[msg.Session]
+			if !exists {
+				return
+			}
+			if _, err := os.Stat(info.Path); os.IsNotExist(err) {
+				os.MkdirAll(info.Path, 0755)
+			}
+			createTmuxSession(tmuxName, info.Path, false)
+			time.Sleep(3 * time.Second)
+		}
+
+		// Persist original, enrich before sending to Claude
+		persistMessage(msg.Session, "user", msg.Content, msg.Channel)
+		enriched := enrichMessage(msg.Content)
+		sendToTmux(tmuxName, enriched)
+	})
+
+	defer router.Stop()
+
 	setBotCommands(config.BotToken)
 
 	sigChan := make(chan os.Signal, 1)
@@ -618,7 +804,7 @@ func listen() error {
 	}()
 
 	for {
-		reqURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", config.BotToken, offset)
+		reqURL := fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=30", TelegramAPIBase(config), config.BotToken, offset)
 		resp, err := telegramClientGet(client, config.BotToken, reqURL)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Network error: %v (retrying...)\n", err)
@@ -834,6 +1020,105 @@ func listen() error {
 				continue
 			}
 
+			if strings.HasPrefix(text, "/skills") {
+				arg := strings.TrimSpace(strings.TrimPrefix(text, "/skills"))
+				if arg == "" {
+					// List skills
+					skills := scanSkills()
+					if len(skills) == 0 {
+						sendMessage(config, chatID, threadID, "No skills found. Use `/skills sync` or `/skills install <slug>`")
+					} else {
+						var sb strings.Builder
+						sb.WriteString(fmt.Sprintf("📚 %d skill(s):\n\n", len(skills)))
+						for _, s := range skills {
+							icon := "⬜"
+							if s.Synced {
+								icon = "✅"
+							}
+							sb.WriteString(fmt.Sprintf("%s %s [%s]\n", icon, s.Name, s.Source))
+						}
+						sendMessage(config, chatID, threadID, sb.String())
+					}
+				} else if arg == "check" {
+					skills := scanSkills()
+					enrichSkills(skills, config)
+					ready, needDeps, needEnv, needCfg, osIncompat := 0, 0, 0, 0, 0
+					var sb strings.Builder
+					sb.WriteString(fmt.Sprintf("📚 Skill Readiness (%d skills, %s):\n\n", len(skills), currentOSLabel()))
+					for _, s := range skills {
+						if s.Readiness == nil {
+							continue
+						}
+						r := s.Readiness
+						emoji := ""
+						if s.Meta != nil && s.Meta.Metadata != nil && s.Meta.Metadata.Emoji != "" {
+							emoji = s.Meta.Metadata.Emoji + " "
+						}
+						if !r.OSCompatible {
+							sb.WriteString(fmt.Sprintf("⏭ %s%s\n", emoji, s.Name))
+							osIncompat++
+						} else if len(r.MissingConfig) > 0 {
+							sb.WriteString(fmt.Sprintf("⚙️ %s%s\n", emoji, s.Name))
+							needCfg++
+						} else if len(r.MissingEnv) > 0 {
+							sb.WriteString(fmt.Sprintf("🔑 %s%s\n", emoji, s.Name))
+							needEnv++
+						} else if len(r.MissingBins) > 0 {
+							sb.WriteString(fmt.Sprintf("📦 %s%s\n", emoji, s.Name))
+							needDeps++
+						} else {
+							sb.WriteString(fmt.Sprintf("✅ %s%s\n", emoji, s.Name))
+							ready++
+						}
+					}
+					sb.WriteString(fmt.Sprintf("\n%d ready, %d need bins, %d need env, %d need config, %d OS-skip", ready, needDeps, needEnv, needCfg, osIncompat))
+					sendMessage(config, chatID, threadID, sb.String())
+				} else if arg == "sync" || arg == "sync --all" {
+					forceAll := strings.Contains(arg, "--all")
+					synced, skipped, excluded, err := syncSkills(forceAll)
+					if err != nil {
+						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Sync error: %v", err))
+					} else {
+						msg := fmt.Sprintf("✅ Synced %d, skipped %d", synced, skipped)
+						if excluded > 0 {
+							msg += fmt.Sprintf(", excluded %d (OS)", excluded)
+						}
+						sendMessage(config, chatID, threadID, msg)
+					}
+				} else if strings.HasPrefix(arg, "install-deps ") {
+					name := strings.TrimPrefix(arg, "install-deps ")
+					sendMessage(config, chatID, threadID, fmt.Sprintf("📦 Installing deps for %s...", name))
+					go func() {
+						defer func() { recover() }()
+						actions, err := installSkillDeps(name)
+						var sb strings.Builder
+						for _, a := range actions {
+							sb.WriteString(fmt.Sprintf("  %s\n", a))
+						}
+						if err != nil {
+							sb.WriteString(fmt.Sprintf("❌ %v", err))
+						} else {
+							sb.WriteString("✅ Done")
+						}
+						sendMessage(config, chatID, threadID, sb.String())
+					}()
+				} else if strings.HasPrefix(arg, "install ") {
+					slug := strings.TrimPrefix(arg, "install ")
+					sendMessage(config, chatID, threadID, fmt.Sprintf("📦 Installing %s...", slug))
+					go func() {
+						defer func() { recover() }()
+						if err := installSkillFromHub(slug); err != nil {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Install failed: %v", err))
+						} else {
+							sendMessage(config, chatID, threadID, fmt.Sprintf("✅ Installed: %s", slug))
+						}
+					}()
+				} else {
+					sendMessage(config, chatID, threadID, "Usage: /skills, /skills check, /skills sync [--all], /skills install <slug>, /skills install-deps <name>")
+				}
+				continue
+			}
+
 			if text == "/auth" {
 				go handleAuth(config, chatID, threadID)
 				continue
@@ -938,6 +1223,13 @@ func listen() error {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("🚀 Session '%s' auto-started", sessName))
 						time.Sleep(3 * time.Second) // Wait for Claude to fully start
 					}
+					// Persist user message from Telegram
+					persistMessage(sessName, "user", text, "telegram")
+					// Notify user if Claude is busy so they know the message is queued
+					busy := !isClaudeReady(tmuxName)
+					if busy {
+						sendMessage(config, chatID, threadID, "⏳ Claude is busy, message queued...")
+					}
 					if err := sendToTmux(tmuxName, text); err != nil {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
 					}
@@ -989,7 +1281,8 @@ func listen() error {
 func printHelp() {
 	fmt.Printf(`ccc - Claude Code Companion v%s
 
-Your companion for Claude Code - control sessions remotely via Telegram and tmux.
+Your companion for Claude Code - control sessions remotely via Telegram, Signal,
+Discord, and WebSocket. Bridges messaging channels to tmux-based Claude sessions.
 
 USAGE:
     ccc                     Start/attach tmux session in current directory
@@ -1003,12 +1296,21 @@ COMMANDS:
     config projects-dir <path>  Set base directory for projects
     config oauth-token <token>  Set OAuth token
     setgroup                Configure Telegram group for topics (if skipped during setup)
-    listen                  Start the Telegram bot listener manually
+    listen                  Start bot listener + gateway + channels
     install                 Install Claude hook manually
     send <file>             Send file to current session's Telegram topic
+    start <name> <dir> <prompt>  Create detached session with prompt
     relay [port]            Start relay server for large files (default: 8080)
     run                     Run Claude directly (used by tmux sessions)
     hook                    Handle Claude hook (internal)
+
+SKILLS:
+    skills                  List all discovered skills
+    skills check            Check readiness per skill (OS, bins, env, config)
+    skills sync [--all]     Sync skills to Claude Code (--all includes OS-incompatible)
+    skills install <slug>   Install skill from ClawHub registry
+    skills install-deps <name>  Install missing deps for a skill
+    skills search <query>   Search ClawHub for skills
 
 TELEGRAM COMMANDS:
     /new <name>             Create new session with topic (in projects_dir)
@@ -1016,6 +1318,14 @@ TELEGRAM COMMANDS:
     /new                    Restart session in current topic
     /c <cmd>                Execute shell command
     /update                 Update ccc binary from GitHub
+    /stats                  Show system stats
+    /skills                 List/sync/install/check skills
+
+GATEWAY:
+    WebSocket: ws://127.0.0.1:18789/ws (auth: Bearer token)
+    REST:      http://127.0.0.1:18789/sessions
+               http://127.0.0.1:18789/sessions/<name>/messages
+               http://127.0.0.1:18789/health
 
 FLAGS:
     -h, --help              Show this help

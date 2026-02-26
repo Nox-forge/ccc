@@ -53,7 +53,21 @@ func createSession(config *Config, name string) error {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
+	// Sync session to persistence store
+	syncSessionToStore(name, topicID, workDir)
+
 	return nil
+}
+
+// syncSessionToStore persists session info to SQLite (fire-and-forget).
+func syncSessionToStore(name string, topicID int64, path string) {
+	go func() {
+		defer func() { recover() }()
+		if err := initStore(); err != nil {
+			return
+		}
+		store.UpsertSession(name, topicID, path)
+	}()
 }
 
 func killSession(config *Config, name string) error {
@@ -149,6 +163,53 @@ func startSession(continueSession bool) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// getContextPrimer builds a context restoration prompt from the latest snapshot
+// and recent message history. Returns empty string if no context is available.
+func getContextPrimer(sessionName string) string {
+	if err := initStore(); err != nil {
+		return ""
+	}
+
+	var parts []string
+
+	// Get latest snapshot
+	snap, err := store.GetLatestSnapshot(sessionName)
+	if err == nil && snap != nil {
+		parts = append(parts, fmt.Sprintf("## Previous Context Summary\n%s", snap.Summary))
+	}
+
+	// Get recent messages since the snapshot (or last 20 if no snapshot)
+	var messages []Message
+	if snap != nil {
+		messages, _ = store.GetMessagesSince(sessionName, snap.Timestamp)
+	} else {
+		messages, _ = store.GetMessages(sessionName, 20)
+	}
+
+	if len(messages) > 0 {
+		var msgLines []string
+		for _, m := range messages {
+			prefix := "User"
+			if m.Role == "assistant" {
+				prefix = "Assistant"
+			}
+			// Truncate long messages for the primer
+			content := m.Content
+			if len(content) > 500 {
+				content = content[:500] + "..."
+			}
+			msgLines = append(msgLines, fmt.Sprintf("**%s** (%s): %s", prefix, m.Channel, content))
+		}
+		parts = append(parts, fmt.Sprintf("## Recent Conversation\n%s", strings.Join(msgLines, "\n\n")))
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("<system-reminder>\nThis session was restored. Here is context from the previous session:\n\n%s\n</system-reminder>", strings.Join(parts, "\n\n"))
 }
 
 // startDetached creates a Telegram topic, tmux session with Claude, and sends a prompt (no attach)
