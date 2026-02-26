@@ -14,7 +14,8 @@ type SessionInfo struct {
 	TopicID         int64  `json:"topic_id"`
 	Path            string `json:"path"`
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
-	SignalNumber    string `json:"signal_number,omitempty"` // Signal recipient for this session
+	SignalNumber    string `json:"signal_number,omitempty"`  // Signal recipient for this session
+	VerboseTopicID  int64  `json:"verbose_topic_id,omitempty"` // Full Output topic for verbose-hook
 }
 
 // GatewayConfig stores gateway server settings.
@@ -57,11 +58,23 @@ type Config struct {
 	ProjectsDir       string                  `json:"projects_dir,omitempty"`       // Base directory for new projects (default: ~)
 	TranscriptionLang string                  `json:"transcription_lang,omitempty"` // Language code for whisper (e.g. "es", "en")
 	RelayURL          string                  `json:"relay_url,omitempty"`          // Relay server URL for large file transfers
+	APIBase           string                  `json:"api_base,omitempty"`           // Telegram API base URL (default: https://api.telegram.org)
 	Away              bool                    `json:"away"`
 	OAuthToken        string                  `json:"oauth_token,omitempty"`
 	Gateway           *GatewayConfig          `json:"gateway,omitempty"`
 	Channels          *ChannelsConfig         `json:"channels,omitempty"`
 	Skills            *SkillsConfig           `json:"skills,omitempty"`
+}
+
+// TelegramAPIBase returns the Telegram API base URL, checking config, env, then default.
+func TelegramAPIBase(config *Config) string {
+	if config != nil && config.APIBase != "" {
+		return config.APIBase
+	}
+	if base := os.Getenv("TELEGRAM_API_BASE"); base != "" {
+		return base
+	}
+	return "https://api.telegram.org"
 }
 
 // TelegramMessage represents a Telegram message
@@ -126,8 +139,15 @@ type TelegramUpdate struct {
 // TelegramResponse represents a response from Telegram API
 type TelegramResponse struct {
 	OK          bool            `json:"ok"`
+	ErrorCode   int             `json:"error_code,omitempty"`
 	Description string          `json:"description,omitempty"`
 	Result      json.RawMessage `json:"result,omitempty"`
+	Parameters  *RateLimitInfo  `json:"parameters,omitempty"`
+}
+
+// RateLimitInfo contains rate limit parameters from Telegram 429 responses
+type RateLimitInfo struct {
+	RetryAfter int `json:"retry_after,omitempty"`
 }
 
 // TopicResult represents the result of creating a forum topic
@@ -355,8 +375,24 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "hook-sweep":
+		// Delayed sweep: ccc hook-sweep <session> <transcript> <sweepID>
+		if len(os.Args) < 5 {
+			os.Exit(1)
+		}
+		if err := handleSweepHook(os.Args[2], os.Args[3], os.Args[4]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "hook-notification":
 		if err := handleNotificationHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "hook-ralph-iteration":
+		if err := handleRalphIterationHook(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

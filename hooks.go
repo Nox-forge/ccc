@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -19,6 +20,35 @@ const (
 	imageCompactCooldown  = 5 * time.Minute
 	imageWarnCooldown     = 10 * time.Minute
 )
+
+// fixHookDataCasing handles Claude Code sending camelCase JSON keys instead of snake_case.
+// The verbose-hook (Python) already handles both formats. This ensures Go code does too.
+func fixHookDataCasing(hookData *HookData, rawData []byte) {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(rawData, &raw) != nil {
+		return
+	}
+	if hookData.TranscriptPath == "" {
+		if v, ok := raw["transcriptPath"]; ok {
+			json.Unmarshal(v, &hookData.TranscriptPath)
+		}
+	}
+	if hookData.HookEventName == "" {
+		if v, ok := raw["hookEventName"]; ok {
+			json.Unmarshal(v, &hookData.HookEventName)
+		}
+	}
+	if hookData.ToolName == "" {
+		if v, ok := raw["toolName"]; ok {
+			json.Unmarshal(v, &hookData.ToolName)
+		}
+	}
+	if hookData.SessionID == "" {
+		if v, ok := raw["sessionId"]; ok {
+			json.Unmarshal(v, &hookData.SessionID)
+		}
+	}
+}
 
 // sendSignalMessage sends a message via Signal using send-signal script.
 // It's fire-and-forget (runs in goroutine, errors logged to stderr).
@@ -48,12 +78,20 @@ func handleHook() error {
 	}
 
 	// Read hook data from stdin
+	rawData, _ := io.ReadAll(os.Stdin)
+	if len(rawData) == 0 {
+		fmt.Fprintf(os.Stderr, "hook: empty stdin\n")
+		return nil
+	}
+
 	var hookData HookData
-	decoder := json.NewDecoder(os.Stdin)
-	if err := decoder.Decode(&hookData); err != nil {
+	if err := json.Unmarshal(rawData, &hookData); err != nil {
 		fmt.Fprintf(os.Stderr, "hook: decode error: %v\n", err)
 		return nil
 	}
+
+	// Handle camelCase variants from Claude Code
+	fixHookDataCasing(&hookData, rawData)
 
 	fmt.Fprintf(os.Stderr, "hook: cwd=%s transcript=%s\n", hookData.Cwd, hookData.TranscriptPath)
 
@@ -78,16 +116,36 @@ func handleHook() error {
 
 	fmt.Fprintf(os.Stderr, "hook: session=%s topic=%d\n", sessionName, topicID)
 
-	// Read last message from transcript
+	// Read last message from transcript with retry (transcript may not be flushed yet)
 	lastMessage := "Session ended"
+	hookLog("stop: session=%s transcript=%q", sessionName, hookData.TranscriptPath)
 	if hookData.TranscriptPath != "" {
-		if msg := getLastAssistantMessage(hookData.TranscriptPath); msg != "" {
-			lastMessage = msg
+		// Try up to 5 times with 500ms delay to wait for transcript flush
+		for attempt := 0; attempt < 5; attempt++ {
+			msg := getLastAssistantMessage(hookData.TranscriptPath)
+			if strings.TrimSpace(msg) != "" {
+				lastMessage = msg
+				hookLog("stop: got message on attempt %d: %q", attempt, truncate(msg, 80))
+				break
+			}
+			hookLog("stop: attempt %d returned empty/whitespace: %q", attempt, truncate(msg, 40))
+			time.Sleep(500 * time.Millisecond)
+		}
+	} else {
+		hookLog("stop: no transcript path!")
+	}
+
+	// Check if this message was already sent by a sweep (dedup)
+	cacheFile := filepath.Join(os.TempDir(), "ccc-cache-"+sessionName)
+	alreadySent := false
+	if lastSent, readErr := os.ReadFile(cacheFile); readErr == nil {
+		if strings.TrimSpace(string(lastSent)) == strings.TrimSpace(lastMessage) && lastMessage != "Session ended" {
+			alreadySent = true
+			hookLog("stop: message already sent by sweep, skipping Telegram send")
 		}
 	}
 
 	// Clear the cache so future PostToolUse hooks don't think this message was sent
-	cacheFile := filepath.Join(os.TempDir(), "ccc-cache-"+sessionName)
 	os.Remove(cacheFile)
 	msgIDFile := filepath.Join(os.TempDir(), "ccc-msgid-"+sessionName)
 	os.Remove(msgIDFile)
@@ -103,8 +161,21 @@ func handleHook() error {
 	// Notify gateway
 	notifyGateway(sessionName, "assistant", lastMessage, "stop")
 
-	// Always send the Stop message (final result)
-	err = sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
+	// Cancel any pending sweep to prevent duplicates
+	sweepFile := filepath.Join(os.TempDir(), "ccc-sweep-"+sessionName)
+	os.WriteFile(sweepFile, []byte("stop-cancelled"), 0600)
+
+	// Send only if the sweep didn't already send this message
+	if !alreadySent {
+		hookLog("stop: SENDING to topic %d (%d chars): %q", topicID, len(lastMessage), truncate(lastMessage, 80))
+		err = sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s\n\n%s", sessionName, lastMessage))
+		if err != nil {
+			hookLog("stop: SEND FAILED session=%s: %v", sessionName, err)
+		} else {
+			hookLog("stop: SENT OK session=%s", sessionName)
+			os.WriteFile(cacheFile, []byte(lastMessage), 0600)
+		}
+	}
 
 	// Also send via Signal if configured
 	if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
@@ -145,6 +216,9 @@ func handlePermissionHook() error {
 		return nil
 	}
 
+	// Handle camelCase variants from Claude Code
+	fixHookDataCasing(&hookData, rawData)
+
 	// Load config - ignore errors
 	config, err := loadConfig()
 	if err != nil || config == nil {
@@ -170,67 +244,61 @@ func handlePermissionHook() error {
 		return nil
 	}
 
-	// Handle AskUserQuestion (plan approval, etc.) - in goroutine to not block
+	// Handle AskUserQuestion (plan approval, etc.) — synchronous to avoid goroutine data loss
 	fmt.Fprintf(os.Stderr, "hook-permission: tool=%s questions=%d\n", hookData.ToolName, len(hookData.ToolInput.Questions))
 	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
-		go func() {
-			defer func() { recover() }()
-			for qIdx, q := range hookData.ToolInput.Questions {
-				if q.Question == "" {
+		for qIdx, q := range hookData.ToolInput.Questions {
+			if q.Question == "" {
+				continue
+			}
+			// Build message
+			msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
+
+			// Build inline keyboard buttons
+			var buttons [][]InlineKeyboardButton
+			for i, opt := range q.Options {
+				if opt.Label == "" {
 					continue
 				}
-				// Build message
-				msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
-
-				// Build inline keyboard buttons
-				var buttons [][]InlineKeyboardButton
-				for i, opt := range q.Options {
-					if opt.Label == "" {
-						continue
-					}
-					// Callback data format: session:questionIndex:optionIndex
-					// Telegram limits callback_data to 64 bytes
-					totalQuestions := len(hookData.ToolInput.Questions)
-					callbackData := fmt.Sprintf("%s:%d:%d:%d", sessionName, qIdx, totalQuestions, i)
-					if len(callbackData) > 64 {
-						callbackData = callbackData[:64]
-					}
-					buttons = append(buttons, []InlineKeyboardButton{
-						{Text: opt.Label, CallbackData: callbackData},
-					})
+				// Callback data format: session:questionIndex:optionIndex
+				// Telegram limits callback_data to 64 bytes
+				totalQuestions := len(hookData.ToolInput.Questions)
+				callbackData := fmt.Sprintf("%s:%d:%d:%d", sessionName, qIdx, totalQuestions, i)
+				if len(callbackData) > 64 {
+					callbackData = callbackData[:64]
 				}
-
-				if len(buttons) > 0 {
-					sendMessageWithKeyboard(config, config.GroupID, topicID, msg, buttons)
-				}
-
-				// Also send via Signal if configured
-				if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
-					sigMsg := fmt.Sprintf("[%s] %s\n%s", sessionName, q.Header, q.Question)
-					for _, opt := range q.Options {
-						if opt.Label != "" {
-							sigMsg += fmt.Sprintf("\n• %s", opt.Label)
-						}
-					}
-					sendSignalMessage(sigNum, sigMsg)
-				}
+				buttons = append(buttons, []InlineKeyboardButton{
+					{Text: opt.Label, CallbackData: callbackData},
+				})
 			}
-		}()
+
+			if len(buttons) > 0 {
+				sendMessageWithKeyboard(config, config.GroupID, topicID, msg, buttons)
+			}
+
+			// Also send via Signal if configured
+			if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+				sigMsg := fmt.Sprintf("[%s] %s\n%s", sessionName, q.Header, q.Question)
+				for _, opt := range q.Options {
+					if opt.Label != "" {
+						sigMsg += fmt.Sprintf("\n• %s", opt.Label)
+					}
+				}
+				sendSignalMessage(sigNum, sigMsg)
+			}
+		}
 		return nil
 	}
 
-	// Generic permission request - in goroutine to not block
-	go func() {
-		defer func() { recover() }()
-		if hookData.ToolName != "" {
-			msg := fmt.Sprintf("🔐 Permission requested: %s", hookData.ToolName)
-			sendMessage(config, config.GroupID, topicID, msg)
-			// Also send via Signal if configured
-			if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
-				sendSignalMessage(sigNum, fmt.Sprintf("[%s] Permission requested: %s", sessionName, hookData.ToolName))
-			}
+	// Generic permission request — synchronous
+	if hookData.ToolName != "" {
+		msg := fmt.Sprintf("🔐 Permission requested: %s", hookData.ToolName)
+		sendMessage(config, config.GroupID, topicID, msg)
+		// Also send via Signal if configured
+		if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+			sendSignalMessage(sigNum, fmt.Sprintf("[%s] Permission requested: %s", sessionName, hookData.ToolName))
 		}
-	}()
+	}
 
 	return nil
 }
@@ -283,12 +351,19 @@ func handlePromptHook() error {
 		return nil
 	}
 
+	rawData, _ := io.ReadAll(os.Stdin)
+	if len(rawData) == 0 {
+		return nil
+	}
+
 	var hookData HookData
-	decoder := json.NewDecoder(os.Stdin)
-	if err := decoder.Decode(&hookData); err != nil {
+	if err := json.Unmarshal(rawData, &hookData); err != nil {
 		fmt.Fprintf(os.Stderr, "hook-prompt: decode error: %v\n", err)
 		return nil
 	}
+
+	// Handle camelCase variants from Claude Code
+	fixHookDataCasing(&hookData, rawData)
 
 	if hookData.Prompt == "" {
 		fmt.Fprintf(os.Stderr, "hook-prompt: empty prompt\n")
@@ -328,6 +403,25 @@ func handlePromptHook() error {
 		}
 	}
 
+	// Enrich the prompt with memory context (goes to Claude only, not Telegram)
+	if ctx := getEnrichmentContext(hookData.Prompt); ctx != "" {
+		hookOutput := map[string]any{
+			"hookSpecificOutput": map[string]any{
+				"hookEventName":     "UserPromptSubmit",
+				"additionalContext": ctx,
+			},
+		}
+		if outBytes, err := json.Marshal(hookOutput); err == nil {
+			fmt.Fprintln(os.Stdout, string(outBytes))
+		}
+
+		// Save enrich context for tmux-forward full output channel
+		if sessionName != "" {
+			enrichFile := filepath.Join(os.TempDir(), "ccc-enrich-"+sessionName)
+			os.WriteFile(enrichFile, []byte(ctx), 0600)
+		}
+	}
+
 	// Send typing action
 	sendTypingAction(config, config.GroupID, topicID)
 
@@ -342,24 +436,64 @@ func handlePromptHook() error {
 		}
 	}
 
+	// Launch a sweep to catch text-only responses (no tool calls).
+	// The cache was just updated above (lines 388-393) with the current last
+	// assistant message, so the sweep will only send NEW text from Claude's
+	// response to this prompt. If Claude uses tools, PostToolUse sweeps will
+	// supersede this one.
+	if sessionName != "" && hookData.TranscriptPath != "" {
+		launchDelayedSweep(sessionName, hookData.TranscriptPath)
+	}
+
 	return err
+}
+
+func hookLog(format string, args ...interface{}) {
+	f, err := os.OpenFile("/tmp/ccc-hook-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s ", time.Now().Format("15:04:05.000"))
+	fmt.Fprintf(f, format+"\n", args...)
 }
 
 func handleOutputHook() error {
 	config, err := loadConfig()
 	if err != nil {
+		hookLog("output: loadConfig error: %v", err)
 		return nil
 	}
 
 	rawData, _ := io.ReadAll(os.Stdin)
 	if len(rawData) == 0 {
+		hookLog("output: empty stdin")
 		return nil
 	}
 
+	// Log raw JSON keys for debugging
+	var rawKeys map[string]json.RawMessage
+	json.Unmarshal(rawData, &rawKeys)
+	var keyNames []string
+	for k := range rawKeys {
+		keyNames = append(keyNames, k)
+	}
+	hookLog("output: raw keys=%v", keyNames)
+
 	var hookData HookData
 	if err := json.Unmarshal(rawData, &hookData); err != nil {
+		hookLog("output: json decode error: %v", err)
 		return nil
 	}
+
+	hookLog("output: BEFORE fix - event=%q tool=%q transcript=%q cwd=%q",
+		hookData.HookEventName, hookData.ToolName, hookData.TranscriptPath, hookData.Cwd)
+
+	// Handle camelCase variants from Claude Code
+	fixHookDataCasing(&hookData, rawData)
+
+	hookLog("output: AFTER fix - event=%q tool=%q transcript=%q",
+		hookData.HookEventName, hookData.ToolName, hookData.TranscriptPath)
 
 	// Find session by matching cwd with saved path
 	var sessionName string
@@ -377,53 +511,83 @@ func handleOutputHook() error {
 	}
 
 	if topicID == 0 || config.GroupID == 0 || sessionName == "" {
+		hookLog("output: no session for cwd=%s", hookData.Cwd)
 		return nil
 	}
 
-	// Get last message from transcript
-	if hookData.TranscriptPath != "" {
-		if msg := getLastAssistantMessage(hookData.TranscriptPath); msg != "" {
-			cacheFile := filepath.Join(os.TempDir(), "ccc-cache-"+sessionName)
-			msgIDFile := filepath.Join(os.TempDir(), "ccc-msgid-"+sessionName)
-			lastSent, _ := os.ReadFile(cacheFile)
+	hookLog("output: session=%s topic=%d", sessionName, topicID)
 
-			// PostToolUse: try to edit existing message
-			if hookData.HookEventName == "PostToolUse" {
-				if msgIDData, err := os.ReadFile(msgIDFile); err == nil {
-					if msgID, err := strconv.ParseInt(string(msgIDData), 10, 64); err == nil && msgID > 0 {
-						// Only edit if message changed (normalize for comparison)
-						if strings.TrimSpace(string(lastSent)) != strings.TrimSpace(msg) {
+	// Get last message from transcript
+	if hookData.TranscriptPath == "" {
+		hookLog("output: no transcript path!")
+		return nil
+	}
+
+	msg := getLastAssistantMessage(hookData.TranscriptPath)
+	hookLog("output: getLastAssistantMessage returned %d chars: %q", len(msg), truncate(msg, 80))
+
+	if strings.TrimSpace(msg) != "" {
+		cacheFile := filepath.Join(os.TempDir(), "ccc-cache-"+sessionName)
+		msgIDFile := filepath.Join(os.TempDir(), "ccc-msgid-"+sessionName)
+		lockFile := filepath.Join(os.TempDir(), "ccc-lock-"+sessionName)
+
+		// Use file lock to prevent race conditions between parallel hooks
+		lock, lockErr := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0600)
+		if lockErr == nil {
+			syscall.Flock(int(lock.Fd()), syscall.LOCK_EX)
+			defer func() {
+				syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+				lock.Close()
+			}()
+		}
+
+		lastSent, _ := os.ReadFile(cacheFile)
+		hookLog("output: cache=%q", truncate(string(lastSent), 80))
+
+		// PostToolUse: try to edit existing message
+		if hookData.HookEventName == "PostToolUse" {
+			if msgIDData, err := os.ReadFile(msgIDFile); err == nil {
+				if msgID, err := strconv.ParseInt(string(msgIDData), 10, 64); err == nil && msgID > 0 {
+					// Only edit if message changed (normalize for comparison)
+					if strings.TrimSpace(string(lastSent)) != strings.TrimSpace(msg) {
+						hookLog("output: editing msg %d", msgID)
+						if editErr := editMessage(config, config.GroupID, msgID, topicID, msg); editErr == nil {
 							os.WriteFile(cacheFile, []byte(msg), 0600)
-							editMessage(config, config.GroupID, msgID, topicID, msg)
-							// Persist and notify gateway
-							persistMessage(sessionName, "assistant", msg, "claude")
-							notifyGateway(sessionName, "assistant", msg, "message")
 						}
-						return nil
+						// Persist and notify gateway
+						persistMessage(sessionName, "assistant", msg, "claude")
+						notifyGateway(sessionName, "assistant", msg, "message")
 					}
+					return nil
 				}
 			}
+		}
 
-			// PreToolUse or no existing message: check for duplicates, then send new
-			// Normalize for comparison (trim whitespace)
-			if strings.TrimSpace(string(lastSent)) == strings.TrimSpace(msg) {
-				return nil // Skip duplicate
-			}
+		// PreToolUse or no existing message: check for duplicates, then send new
+		// Normalize for comparison (trim whitespace)
+		if strings.TrimSpace(string(lastSent)) == strings.TrimSpace(msg) {
+			hookLog("output: SKIP duplicate")
+			return nil // Skip duplicate
+		}
+
+		// Persist assistant message and notify gateway
+		persistMessage(sessionName, "assistant", msg, "claude")
+		notifyGateway(sessionName, "assistant", msg, "message")
+
+		// Add tool name prefix for PreToolUse
+		finalMsg := msg
+		if hookData.HookEventName == "PreToolUse" && hookData.ToolName != "" {
+			finalMsg = fmt.Sprintf("🔧 %s\n\n%s", hookData.ToolName, msg)
+		}
+
+		// Send to Telegram - only update cache on success
+		hookLog("output: SENDING to topic %d: %q", topicID, truncate(finalMsg, 80))
+		if msgID, err := sendMessageGetID(config, config.GroupID, topicID, finalMsg); err == nil && msgID > 0 {
 			os.WriteFile(cacheFile, []byte(msg), 0600)
-
-			// Persist assistant message and notify gateway
-			persistMessage(sessionName, "assistant", msg, "claude")
-			notifyGateway(sessionName, "assistant", msg, "message")
-
-			// Add tool name prefix for PreToolUse
-			finalMsg := msg
-			if hookData.HookEventName == "PreToolUse" && hookData.ToolName != "" {
-				finalMsg = fmt.Sprintf("🔧 %s\n\n%s", hookData.ToolName, msg)
-			}
-
-			if msgID, err := sendMessageGetID(config, config.GroupID, topicID, finalMsg); err == nil && msgID > 0 {
-				os.WriteFile(msgIDFile, []byte(strconv.FormatInt(msgID, 10)), 0600)
-			}
+			os.WriteFile(msgIDFile, []byte(strconv.FormatInt(msgID, 10)), 0600)
+			hookLog("output: SENT OK msgID=%d", msgID)
+		} else {
+			hookLog("output: SEND FAILED for %s: %v", sessionName, err)
 		}
 	}
 
@@ -443,7 +607,156 @@ func handleOutputHook() error {
 		}
 	}
 
+	// Launch a delayed sweep to catch final text responses that appear AFTER
+	// the last tool call (e.g., when Claude responds with just prose).
+	// The sweep waits a few seconds, then re-checks the transcript for new text.
+	if hookData.HookEventName == "PostToolUse" && hookData.TranscriptPath != "" {
+		launchDelayedSweep(sessionName, hookData.TranscriptPath)
+	}
+
 	return nil
+}
+
+// launchDelayedSweep spawns a background `ccc hook-sweep` process that waits,
+// then checks the transcript for unsent assistant text. Uses a sweep timestamp
+// file so that only the most recent sweep actually sends (earlier sweeps bow out).
+func launchDelayedSweep(sessionName, transcriptPath string) {
+	sweepFile := filepath.Join(os.TempDir(), "ccc-sweep-"+sessionName)
+	sweepID := fmt.Sprintf("%d", time.Now().UnixNano())
+	os.WriteFile(sweepFile, []byte(sweepID), 0600)
+	hookLog("sweep: scheduled id=%s session=%s", sweepID, sessionName)
+
+	cmd := exec.Command(cccPath, "hook-sweep", sessionName, transcriptPath, sweepID)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		hookLog("sweep: failed to start: %v", err)
+		return
+	}
+	// Detach — don't wait for child
+	go cmd.Wait()
+}
+
+// handleSweepHook is called as `ccc hook-sweep <session> <transcript> <sweepID>`.
+// It polls the transcript for unsent assistant text over ~45 seconds, checking
+// every 3 seconds. This catches final text responses that appear after the last tool.
+func handleSweepHook(sessionName, transcriptPath, sweepID string) error {
+	hookLog("sweep: started id=%s session=%s", sweepID, sessionName)
+
+	config, err := loadConfig()
+	if err != nil {
+		return nil
+	}
+
+	var topicID int64
+	for name, info := range config.Sessions {
+		if name == sessionName && info != nil {
+			topicID = info.TopicID
+			break
+		}
+	}
+	if topicID == 0 {
+		return nil
+	}
+
+	sweepFile := filepath.Join(os.TempDir(), "ccc-sweep-"+sessionName)
+	cacheFile := filepath.Join(os.TempDir(), "ccc-cache-"+sessionName)
+
+	// Poll up to 15 times (3s intervals = ~45 seconds total)
+	for attempt := 0; attempt < 15; attempt++ {
+		time.Sleep(3 * time.Second)
+
+		// Check if we're still the latest sweep
+		currentID, _ := os.ReadFile(sweepFile)
+		if string(currentID) != sweepID {
+			hookLog("sweep: superseded id=%s attempt=%d (current=%s)", sweepID, attempt, string(currentID))
+			return nil
+		}
+
+		msg := getLastAssistantMessage(transcriptPath)
+		if strings.TrimSpace(msg) == "" {
+			hookLog("sweep: no text found id=%s attempt=%d", sweepID, attempt)
+			continue
+		}
+
+		// Check if this text was already sent
+		lastSent, _ := os.ReadFile(cacheFile)
+		if strings.TrimSpace(string(lastSent)) == strings.TrimSpace(msg) {
+			hookLog("sweep: text unchanged id=%s attempt=%d", sweepID, attempt)
+			continue
+		}
+
+		// Found new text — send it
+		hookLog("sweep: NEW TEXT FOUND id=%s attempt=%d (%d chars): %q", sweepID, attempt, len(msg), truncate(msg, 80))
+		break
+	}
+
+	// Final check after polling loop
+	msg := getLastAssistantMessage(transcriptPath)
+	if strings.TrimSpace(msg) == "" {
+		hookLog("sweep: giving up, no text id=%s", sweepID)
+		return nil
+	}
+
+	msgIDFile := filepath.Join(os.TempDir(), "ccc-msgid-"+sessionName)
+	lockFile := filepath.Join(os.TempDir(), "ccc-lock-"+sessionName)
+
+	lock, lockErr := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0600)
+	if lockErr != nil {
+		return nil
+	}
+	syscall.Flock(int(lock.Fd()), syscall.LOCK_EX)
+	defer func() {
+		syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		lock.Close()
+	}()
+
+	lastSent, _ := os.ReadFile(cacheFile)
+	if strings.TrimSpace(string(lastSent)) == strings.TrimSpace(msg) {
+		hookLog("sweep: text unchanged, skip id=%s", sweepID)
+		return nil
+	}
+
+	hookLog("sweep: SENDING new text id=%s (%d chars): %q", sweepID, len(msg), truncate(msg, 80))
+
+	// Persist and notify
+	persistMessage(sessionName, "assistant", msg, "claude")
+	notifyGateway(sessionName, "assistant", msg, "message")
+
+	// Try to edit existing message first
+	if msgIDData, err := os.ReadFile(msgIDFile); err == nil {
+		if msgID, parseErr := strconv.ParseInt(string(msgIDData), 10, 64); parseErr == nil && msgID > 0 {
+			if editErr := editMessage(config, config.GroupID, msgID, topicID, msg); editErr == nil {
+				os.WriteFile(cacheFile, []byte(msg), 0600)
+				hookLog("sweep: EDITED msgID=%d id=%s", msgID, sweepID)
+				return nil
+			}
+		}
+	}
+
+	// Send as new message
+	if newMsgID, sendErr := sendMessageGetID(config, config.GroupID, topicID, msg); sendErr == nil && newMsgID > 0 {
+		os.WriteFile(cacheFile, []byte(msg), 0600)
+		os.WriteFile(msgIDFile, []byte(strconv.FormatInt(newMsgID, 10)), 0600)
+		hookLog("sweep: SENT OK msgID=%d id=%s", newMsgID, sweepID)
+	} else {
+		hookLog("sweep: SEND FAILED id=%s: %v", sweepID, sendErr)
+	}
+
+	// Also send via Signal if configured
+	if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+		sendSignalMessage(sigNum, fmt.Sprintf("[%s] %s", sessionName, msg))
+	}
+
+	return nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // countImagesInTranscript counts base64 image blocks in the transcript
@@ -577,6 +890,9 @@ func handleQuestionHook() error {
 		return nil
 	}
 
+	// Handle camelCase variants from Claude Code
+	fixHookDataCasing(&hookData, rawData)
+
 	// Find session by matching cwd with saved path
 	var sessionName string
 	var topicID int64
@@ -639,39 +955,131 @@ func handleQuestionHook() error {
 	return nil
 }
 
-// persistMessage saves a message to the store (fire-and-forget, never blocks hooks).
-func persistMessage(session, role, content, channel string) {
-	go func() {
-		defer func() { recover() }()
-		if err := initStore(); err != nil {
-			fmt.Fprintf(os.Stderr, "persist: store init error: %v\n", err)
-			return
-		}
-		if err := store.SaveMessage(session, role, content, channel); err != nil {
-			fmt.Fprintf(os.Stderr, "persist: save error: %v\n", err)
-		}
-	}()
+// RalphIterationData represents data from a Ralph loop iteration.
+// Sent by the Ralph stop hook to persist and relay each iteration.
+type RalphIterationData struct {
+	Cwd            string `json:"cwd"`
+	TranscriptPath string `json:"transcript_path"`
+	Iteration      int    `json:"iteration"`
+	MaxIterations  int    `json:"max_iterations"`
+	Prompt         string `json:"prompt"`
+	LastOutput     string `json:"last_output"`
 }
 
-// persistSnapshot saves a context snapshot from a compact event.
+func handleRalphIterationHook() error {
+	config, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hook-ralph: no config\n")
+		return nil
+	}
+
+	rawData, _ := io.ReadAll(os.Stdin)
+	if len(rawData) == 0 {
+		fmt.Fprintf(os.Stderr, "hook-ralph: empty stdin\n")
+		return nil
+	}
+
+	var data RalphIterationData
+	if err := json.Unmarshal(rawData, &data); err != nil {
+		fmt.Fprintf(os.Stderr, "hook-ralph: decode error: %v\n", err)
+		return nil
+	}
+
+	// Find session by matching cwd with saved path
+	var sessionName string
+	var topicID int64
+	for name, info := range config.Sessions {
+		if info == nil {
+			continue
+		}
+		if data.Cwd == info.Path || strings.HasPrefix(data.Cwd, info.Path+"/") || strings.HasSuffix(data.Cwd, "/"+name) {
+			sessionName = name
+			topicID = info.TopicID
+			break
+		}
+	}
+
+	if sessionName == "" || config.GroupID == 0 {
+		fmt.Fprintf(os.Stderr, "hook-ralph: no session for cwd=%s\n", data.Cwd)
+		return nil
+	}
+
+	// Persist the iteration prompt as a user message so the memory system sees both sides
+	iterLabel := fmt.Sprintf("[Ralph iteration %d", data.Iteration)
+	if data.MaxIterations > 0 {
+		iterLabel += fmt.Sprintf("/%d", data.MaxIterations)
+	}
+	iterLabel += "]"
+
+	promptMsg := fmt.Sprintf("%s\n\n%s", iterLabel, data.Prompt)
+	persistMessage(sessionName, "user", promptMsg, "ralph")
+
+	// Persist the last assistant output explicitly (in case hook-output missed it)
+	if data.LastOutput != "" {
+		persistMessage(sessionName, "assistant", data.LastOutput, "ralph")
+	}
+
+	// Notify gateway about the iteration
+	notifyGateway(sessionName, "user", promptMsg, "ralph-iteration")
+
+	// Send iteration summary to Telegram
+	// Truncate last output for Telegram readability
+	outputSummary := data.LastOutput
+	if len(outputSummary) > 500 {
+		outputSummary = outputSummary[:500] + "..."
+	}
+
+	var iterMsg string
+	if data.MaxIterations > 0 {
+		iterMsg = fmt.Sprintf("🔄 Ralph iteration %d/%d\n\n", data.Iteration, data.MaxIterations)
+	} else {
+		iterMsg = fmt.Sprintf("🔄 Ralph iteration %d\n\n", data.Iteration)
+	}
+	if outputSummary != "" {
+		iterMsg += fmt.Sprintf("📤 Last output:\n%s", outputSummary)
+	}
+
+	if topicID != 0 {
+		sendMessage(config, config.GroupID, topicID, iterMsg)
+	}
+
+	// Also send via Signal if configured
+	if sigNum := getSignalNumber(config, sessionName); sigNum != "" {
+		sendSignalMessage(sigNum, fmt.Sprintf("[%s] %s", sessionName, iterMsg))
+	}
+
+	return nil
+}
+
+// persistMessage saves a message to the store synchronously.
+// Must be synchronous in hook processes — fire-and-forget goroutines get killed
+// when the short-lived CLI process exits, causing silent data loss.
+func persistMessage(session, role, content, channel string) {
+	if err := initStore(); err != nil {
+		fmt.Fprintf(os.Stderr, "persist: store init error: %v\n", err)
+		return
+	}
+	if err := store.SaveMessage(session, role, content, channel); err != nil {
+		fmt.Fprintf(os.Stderr, "persist: save error: %v\n", err)
+	}
+}
+
+// persistSnapshot saves a context snapshot from a compact event synchronously.
 func persistSnapshot(session, transcriptPath string) {
-	go func() {
-		defer func() { recover() }()
-		if err := initStore(); err != nil {
-			fmt.Fprintf(os.Stderr, "persist: store init error: %v\n", err)
-			return
-		}
-		// Extract the summary from the transcript (the text after the last "type":"summary" entry)
-		summary := getCompactSummary(transcriptPath)
-		if summary == "" {
-			summary = "Context compacted (no summary extracted)"
-		}
-		if err := store.SaveSnapshot(session, summary); err != nil {
-			fmt.Fprintf(os.Stderr, "persist: snapshot error: %v\n", err)
-		} else {
-			fmt.Fprintf(os.Stderr, "persist: snapshot saved for session %s (%d bytes)\n", session, len(summary))
-		}
-	}()
+	if err := initStore(); err != nil {
+		fmt.Fprintf(os.Stderr, "persist: store init error: %v\n", err)
+		return
+	}
+	// Extract the summary from the transcript (the text after the last "type":"summary" entry)
+	summary := getCompactSummary(transcriptPath)
+	if summary == "" {
+		summary = "Context compacted (no summary extracted)"
+	}
+	if err := store.SaveSnapshot(session, summary); err != nil {
+		fmt.Fprintf(os.Stderr, "persist: snapshot error: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "persist: snapshot saved for session %s (%d bytes)\n", session, len(summary))
+	}
 }
 
 // getCompactSummary extracts the summary text from the last compact/summary entry in the transcript.
@@ -720,6 +1128,9 @@ func handleNotificationHook() error {
 	if err := json.Unmarshal(rawData, &hookData); err != nil {
 		return nil
 	}
+
+	// Handle camelCase variants from Claude Code
+	fixHookDataCasing(&hookData, rawData)
 
 	if hookData.Notification == "" {
 		return nil

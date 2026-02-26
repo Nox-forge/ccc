@@ -208,7 +208,7 @@ func setup(botToken string) error {
 
 	offset := 0
 	for {
-		resp, err := telegramGet(botToken, fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", botToken, offset))
+		resp, err := telegramGet(botToken, fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=30", TelegramAPIBase(nil), botToken, offset))
 		if err != nil {
 			return fmt.Errorf("failed to get updates: %w", err)
 		}
@@ -254,7 +254,7 @@ step2:
 	deadline := time.Now().Add(30 * time.Second)
 
 	for time.Now().Before(deadline) {
-		reqURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=5", config.BotToken, offset)
+		reqURL := fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=5", TelegramAPIBase(config), config.BotToken, offset)
 		resp, err := telegramClientGet(client, config.BotToken, reqURL)
 		if err != nil {
 			continue
@@ -331,7 +331,7 @@ func setGroup(config *Config) error {
 	client := &http.Client{Timeout: 35 * time.Second}
 
 	for {
-		reqURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", config.BotToken, offset)
+		reqURL := fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=30", TelegramAPIBase(config), config.BotToken, offset)
 		resp, err := telegramClientGet(client, config.BotToken, reqURL)
 		if err != nil {
 			return err
@@ -804,7 +804,7 @@ func listen() error {
 	}()
 
 	for {
-		reqURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", config.BotToken, offset)
+		reqURL := fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=30", TelegramAPIBase(config), config.BotToken, offset)
 		resp, err := telegramClientGet(client, config.BotToken, reqURL)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Network error: %v (retrying...)\n", err)
@@ -1225,6 +1225,11 @@ func listen() error {
 					}
 					// Persist user message from Telegram
 					persistMessage(sessName, "user", text, "telegram")
+					// Notify user if Claude is busy so they know the message is queued
+					busy := !isClaudeReady(tmuxName)
+					if busy {
+						sendMessage(config, chatID, threadID, "⏳ Claude is busy, message queued...")
+					}
 					if err := sendToTmux(tmuxName, text); err != nil {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
 					}

@@ -35,7 +35,11 @@ type ContextSnapshot struct {
 	Timestamp time.Time
 }
 
-var store *Store
+var (
+	store     *Store
+	storeOnce sync.Once
+	storeErr  error
+)
 
 // getDBPath returns the path to the SQLite database.
 func getDBPath() string {
@@ -344,12 +348,11 @@ func (s *Store) Stats() (map[string]int, error) {
 	return stats, nil
 }
 
-// initStore initializes the global store. Safe to call multiple times.
+// initStore initializes the global store using sync.Once for thread safety.
+// Safe to call from multiple goroutines — only opens the DB once.
 func initStore() error {
-	if store != nil {
-		return nil
-	}
-	var err error
-	store, err = OpenStore()
-	return err
+	storeOnce.Do(func() {
+		store, storeErr = OpenStore()
+	})
+	return storeErr
 }

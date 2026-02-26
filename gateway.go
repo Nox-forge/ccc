@@ -579,27 +579,26 @@ func (g *Gateway) sendSessionStatuses(client *wsClient) {
 	}
 }
 
-// notifyGateway sends a hook event to the gateway's internal endpoint (fire-and-forget).
+// notifyGateway sends a hook event to the gateway's internal endpoint synchronously.
+// Uses a short timeout so it doesn't block hooks if the gateway is down.
 func notifyGateway(session, role, content, event string) {
-	go func() {
-		defer func() { recover() }()
-		payload := HookPayload{
-			Session: session,
-			Role:    role,
-			Content: content,
-			Event:   event,
-		}
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return
-		}
+	payload := HookPayload{
+		Session: session,
+		Role:    role,
+		Content: content,
+		Event:   event,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
 
-		url := fmt.Sprintf("http://127.0.0.1:%d/hook", gatewayHookPort)
-		resp, err := http.Post(url, "application/json", strings.NewReader(string(data)))
-		if err != nil {
-			// Gateway might not be running, that's OK
-			return
-		}
-		resp.Body.Close()
-	}()
+	client := &http.Client{Timeout: 1 * time.Second}
+	url := fmt.Sprintf("http://127.0.0.1:%d/hook", gatewayHookPort)
+	resp, err := client.Post(url, "application/json", strings.NewReader(string(data)))
+	if err != nil {
+		// Gateway might not be running, that's OK
+		return
+	}
+	resp.Body.Close()
 }

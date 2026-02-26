@@ -15,21 +15,7 @@ var (
 	tmuxPath   string
 	cccPath    string
 	claudePath string
-
-	// Per-session mutex to ensure messages are sent one at a time
-	sessionMutexes   = make(map[string]*sync.Mutex)
-	sessionMutexLock sync.Mutex
 )
-
-// getSessionMutex returns a mutex for the given session name
-func getSessionMutex(session string) *sync.Mutex {
-	sessionMutexLock.Lock()
-	defer sessionMutexLock.Unlock()
-	if _, ok := sessionMutexes[session]; !ok {
-		sessionMutexes[session] = &sync.Mutex{}
-	}
-	return sessionMutexes[session]
-}
 
 func initPaths() {
 	// Find tmux binary
@@ -87,8 +73,8 @@ func createTmuxSession(name string, workDir string, continueSession bool) error 
 		cccCmd += " -c"
 	}
 
-	// Ensure tmux server has fast escape-time (critical for reliable key delivery)
-	exec.Command(tmuxPath, "set-option", "-s", "escape-time", "10").Run()
+	// Ensure CLAUDECODE is not in tmux global env (prevents "nested session" errors)
+	exec.Command(tmuxPath, "set-environment", "-g", "-u", "CLAUDECODE").Run()
 
 	// Create tmux session with a login shell (don't run command directly - it kills session on exit)
 	args := []string{"new-session", "-d", "-s", name, "-c", workDir}
@@ -99,6 +85,9 @@ func createTmuxSession(name string, workDir string, continueSession bool) error 
 
 	// Enable mouse mode for this session (allows scrolling)
 	exec.Command(tmuxPath, "set-option", "-t", name, "mouse", "on").Run()
+
+	// Unset CLAUDECODE in session env too, in case it was inherited
+	exec.Command(tmuxPath, "set-environment", "-t", name, "-u", "CLAUDECODE").Run()
 
 	// Send the command to the session via send-keys (preserves TTY properly)
 	time.Sleep(200 * time.Millisecond)
@@ -133,74 +122,197 @@ func runClaudeRaw(continueSession bool) error {
 	return cmd.Run()
 }
 
+// isClaudeReady checks if Claude Code is at the input prompt (❯) at the bottom of the pane.
+// This is more precise than just checking for ❯ anywhere (which could be in scrollback).
+func isClaudeReady(session string) bool {
+	cmd := exec.Command(tmuxPath, "capture-pane", "-t", session, "-p")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	// Check the last few non-empty lines for the prompt
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	// Check last 15 lines — Claude HUD status line can push prompt 6+ lines up
+	start := len(lines) - 15
+	if start < 0 {
+		start = 0
+	}
+	for _, line := range lines[start:] {
+		if strings.Contains(line, "❯") {
+			return true
+		}
+	}
+	return false
+}
+
 // waitForClaude polls the tmux pane until Claude Code's input prompt appears
 func waitForClaude(session string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		cmd := exec.Command(tmuxPath, "capture-pane", "-t", session, "-p")
-		out, err := cmd.Output()
-		if err == nil {
-			content := string(out)
-			// Claude Code shows "❯" when ready for input
-			if strings.Contains(content, "❯") {
-				return nil
-			}
+		if isClaudeReady(session) {
+			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("timeout waiting for Claude to start")
+	return fmt.Errorf("timeout waiting for Claude to be ready")
+}
+
+// dismissFeedbackDialog checks if Claude Code's "How is Claude doing?" feedback
+// dialog is visible in the pane and dismisses it by sending "0" (Dismiss).
+// This prevents the dialog from eating Enter keys intended for message submission.
+func dismissFeedbackDialog(session string) {
+	cmd := exec.Command(tmuxPath, "capture-pane", "-t", session, "-p")
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	// Check last 15 lines for the feedback dialog
+	start := len(lines) - 15
+	if start < 0 {
+		start = 0
+	}
+	for _, line := range lines[start:] {
+		if strings.Contains(line, "How is Claude doing") {
+			// Send "0" to dismiss the dialog
+			exec.Command(tmuxPath, "send-keys", "-t", session, "-l", "0").Run()
+			time.Sleep(300 * time.Millisecond)
+			return
+		}
+	}
+}
+
+// sessionQueue manages a per-session message queue so messages are sent
+// one at a time, each waiting for Claude to be ready before sending.
+type sessionQueue struct {
+	ch chan string
+}
+
+var (
+	sessionQueues   = make(map[string]*sessionQueue)
+	sessionQueuesMu sync.Mutex
+)
+
+func getSessionQueue(session string) *sessionQueue {
+	sessionQueuesMu.Lock()
+	defer sessionQueuesMu.Unlock()
+	if q, ok := sessionQueues[session]; ok {
+		return q
+	}
+	q := &sessionQueue{ch: make(chan string, 100)}
+	sessionQueues[session] = q
+	go q.run(session)
+	return q
+}
+
+func (q *sessionQueue) run(session string) {
+	for text := range q.ch {
+		fmt.Fprintf(os.Stderr, "queue[%s]: waiting for Claude to be ready, msg: %q\n", session, truncateMsg(text, 80))
+		// Wait for Claude to be ready (prompt visible)
+		for i := 0; i < 1200; i++ { // 10 minutes max (1200 * 500ms)
+			if isClaudeReady(session) {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		// Extra settle time after prompt appears
+		time.Sleep(500 * time.Millisecond)
+		dismissFeedbackDialog(session)
+
+		fmt.Fprintf(os.Stderr, "queue[%s]: Claude ready, sending queued message\n", session)
+		if err := sendToTmuxReliable(session, text); err != nil {
+			fmt.Fprintf(os.Stderr, "queue[%s]: failed to send: %v\n", session, err)
+		}
+		// Wait for Claude to start processing before checking next message
+		time.Sleep(3 * time.Second)
+	}
 }
 
 func sendToTmux(session string, text string) error {
-	// Acquire per-session lock to ensure messages are sent sequentially
-	mu := getSessionMutex(session)
-	mu.Lock()
-	defer mu.Unlock()
+	// Dismiss any active feedback dialog that could eat our Enter keys
+	dismissFeedbackDialog(session)
 
-	// Calculate delay based on text length
-	// Base: 50ms + 0.5ms per character, capped at 5 seconds
-	baseDelay := 50 * time.Millisecond
-	charDelay := time.Duration(len(text)) * 500 * time.Microsecond // 0.5ms per char
+	if isClaudeReady(session) {
+		// Claude is ready — send immediately
+		fmt.Fprintf(os.Stderr, "sendToTmux: Claude ready on %s, sending immediately: %q\n", session, truncateMsg(text, 80))
+		return sendToTmuxReliable(session, text)
+	}
+
+	// Claude is busy — queue the message for delivery when ready
+	fmt.Fprintf(os.Stderr, "sendToTmux: Claude busy on %s, queuing message: %q\n", session, truncateMsg(text, 80))
+	q := getSessionQueue(session)
+	q.ch <- text
+	return nil
+}
+
+// truncateMsg is like truncate in hooks.go but for tmux logging
+func truncateMsg(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// sendToTmuxReliable sends a message and verifies it was accepted by Claude.
+// It retries the Enter key if Claude doesn't start processing within a few seconds.
+func sendToTmuxReliable(session string, text string) error {
+	// Clear any stale input first by sending Ctrl+U (clear line)
+	exec.Command(tmuxPath, "send-keys", "-t", session, "C-u").Run()
+	time.Sleep(100 * time.Millisecond)
+
+	// Send text literally
+	cmd := exec.Command(tmuxPath, "send-keys", "-t", session, "-l", text)
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "sendToTmux: send-keys -l failed on %s: %v\n", session, err)
+		return err
+	}
+
+	// Wait for text to appear in the buffer
+	baseDelay := 100 * time.Millisecond
+	charDelay := time.Duration(len(text)) * time.Millisecond
 	delay := baseDelay + charDelay
 	if delay > 5*time.Second {
 		delay = 5 * time.Second
 	}
-	return sendToTmuxWithDelay(session, text, delay)
+	time.Sleep(delay)
+
+	// Dismiss feedback dialog again (could have appeared while typing)
+	dismissFeedbackDialog(session)
+
+	// Send Enter and verify Claude started processing
+	for attempt := 0; attempt < 3; attempt++ {
+		cmd = exec.Command(tmuxPath, "send-keys", "-t", session, "Enter")
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "sendToTmux: Enter failed on %s attempt %d: %v\n", session, attempt, err)
+			return err
+		}
+		time.Sleep(100 * time.Millisecond)
+
+		// Send a second Enter (Claude Code sometimes needs it for multiline input)
+		exec.Command(tmuxPath, "send-keys", "-t", session, "Enter").Run()
+
+		// Wait a moment then check if Claude started processing (prompt should disappear)
+		time.Sleep(1500 * time.Millisecond)
+
+		if !isClaudeReady(session) {
+			// Claude is processing — message was accepted
+			fmt.Fprintf(os.Stderr, "sendToTmux: message accepted on %s (attempt %d)\n", session, attempt)
+			return nil
+		}
+
+		// Claude is still at prompt — Enter might not have submitted. Retry.
+		fmt.Fprintf(os.Stderr, "sendToTmux: still at prompt on %s after attempt %d, retrying Enter\n", session, attempt)
+		dismissFeedbackDialog(session)
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// After 3 attempts, log but don't error — the message text IS in the buffer
+	fmt.Fprintf(os.Stderr, "sendToTmux: WARNING — message may not have submitted on %s after 3 attempts\n", session)
+	return nil
 }
 
 func sendToTmuxWithDelay(session string, text string, delay time.Duration) error {
-	// Ensure tmux has fast escape-time (critical for reliable key delivery)
-	exec.Command(tmuxPath, "set-option", "-s", "escape-time", "10").Run()
-
-	// CRITICAL: Wait for Claude to be idle at the prompt BEFORE sending text.
-	// If we send while Claude is processing, text goes into the buffer but doesn't
-	// get submitted until Claude finishes, causing "queued messages" behavior.
-	maxWaitForIdle := 5 * time.Minute
-	pollInterval := 500 * time.Millisecond
-	startWait := time.Now()
-
-	for {
-		state := captureSessionState(session)
-
-		// Ready to send: Claude is at the prompt and not processing
-		if state.hasPrompt && !state.isProcessing {
-			break
-		}
-
-		// Timeout - send anyway and hope for the best
-		if time.Since(startWait) > maxWaitForIdle {
-			fmt.Printf("[ccc] ⚠ Timeout waiting for Claude idle, sending anyway\n")
-			break
-		}
-
-		// Still processing - wait and check again
-		if state.isProcessing {
-			fmt.Printf("[ccc] Claude is processing, waiting to send message...\n")
-		}
-		time.Sleep(pollInterval)
-	}
-
-	// Now send the text
+	// Send text literally
 	cmd := exec.Command(tmuxPath, "send-keys", "-t", session, "-l", text)
 	if err := cmd.Run(); err != nil {
 		return err
@@ -209,215 +321,14 @@ func sendToTmuxWithDelay(session string, text string, delay time.Duration) error
 	// Wait for content to load (e.g., images)
 	time.Sleep(delay)
 
-	// Send Enter twice (Claude Code needs double Enter to submit)
-	exec.Command(tmuxPath, "send-keys", "-t", session, "C-m").Run()
-	time.Sleep(30 * time.Millisecond)
-	exec.Command(tmuxPath, "send-keys", "-t", session, "C-m").Run()
-
-	// Verify delivery: check that Claude received the message
-	maxRetries := 5
-	for retry := 0; retry < maxRetries; retry++ {
-		time.Sleep(200 * time.Millisecond)
-
-		state := captureSessionState(session)
-
-		// SUCCESS: Claude is processing (our message was submitted)
-		if state.isProcessing {
-			fmt.Printf("[ccc] ✓ Message delivered (Claude processing)\n")
-			return nil
-		}
-
-		// SUCCESS: Text no longer in input buffer (was submitted)
-		textPrefix := firstNChars(text, 20)
-		if !strings.Contains(state.inputContent, textPrefix) {
-			fmt.Printf("[ccc] ✓ Message delivered (input cleared)\n")
-			return nil
-		}
-
-		// Text still in buffer — send Enter again
-		fmt.Printf("[ccc] Retry %d: text still in buffer, sending Enter\n", retry+1)
-		exec.Command(tmuxPath, "send-keys", "-t", session, "C-m").Run()
-		time.Sleep(30 * time.Millisecond)
-		exec.Command(tmuxPath, "send-keys", "-t", session, "C-m").Run()
+	// Send Enter twice (Claude Code needs double Enter)
+	cmd = exec.Command(tmuxPath, "send-keys", "-t", session, "Enter")
+	if err := cmd.Run(); err != nil {
+		return err
 	}
-
-	// Final check
-	finalState := captureSessionState(session)
-	if finalState.isProcessing || !strings.Contains(finalState.inputContent, firstNChars(text, 20)) {
-		fmt.Printf("[ccc] ✓ Message delivered (final check)\n")
-		return nil
-	}
-
-	fmt.Printf("[ccc] ⚠ Message delivery uncertain\n")
-	return nil
-}
-
-// sessionState captures the current state of a Claude Code tmux session
-type sessionState struct {
-	isProcessing  bool   // Claude is actively working (spinner visible)
-	hasPrompt     bool   // Input prompt ❯ is visible
-	promptLineNum int    // Line number of the prompt
-	inputContent  string // Content in the input area (after ❯)
-	contentHash   string // Hash of visible content (to detect changes)
-}
-
-func captureSessionState(session string) sessionState {
-	out, err := exec.Command(tmuxPath, "capture-pane", "-t", session, "-p").Output()
-	if err != nil {
-		return sessionState{}
-	}
-
-	content := string(out)
-	lines := strings.Split(content, "\n")
-
-	state := sessionState{
-		contentHash: fmt.Sprintf("%d", len(content)), // Simple hash: length
-	}
-
-	// Check for processing indicators
-	state.isProcessing = isClaudeProcessing(content)
-
-	// Find prompt and extract input content
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := lines[i]
-		if strings.Contains(line, "❯") {
-			state.hasPrompt = true
-			state.promptLineNum = i
-
-			// Extract content after prompt
-			promptIdx := strings.LastIndex(line, "❯")
-			afterPrompt := strings.TrimSpace(line[promptIdx+len("❯"):])
-
-			// Also get content from lines below (multi-line input)
-			var inputLines []string
-			if afterPrompt != "" {
-				inputLines = append(inputLines, afterPrompt)
-			}
-			for j := i + 1; j < len(lines) && j < i+10; j++ {
-				nextLine := strings.TrimSpace(lines[j])
-				// Stop at status/decoration lines
-				if strings.HasPrefix(nextLine, "[") || strings.HasPrefix(nextLine, "───") ||
-					strings.HasPrefix(nextLine, "Press") || nextLine == "" {
-					break
-				}
-				inputLines = append(inputLines, nextLine)
-			}
-			state.inputContent = strings.Join(inputLines, " ")
-			break
-		}
-	}
-
-	return state
-}
-
-func firstNChars(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
-
-// isClaudeProcessing checks if Claude Code is actively processing (not idle at prompt).
-func isClaudeProcessing(paneContent string) bool {
-	lines := strings.Split(paneContent, "\n")
-
-	// Check each line for spinners at the START of the line (after trimming)
-	// This avoids false positives from ● bullets in tool output
-	// Skip completion indicators like "✻ Brewed for 2m 52s" - these use many verbs
-	spinners := []string{"✻", "◐", "◑", "◒", "◓", "✢", "✽", "·", "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		// Completion indicators match pattern "✻ <Verb>ed for Xm Ys" or "✻ <Verb>ed for Xs"
-		// Skip any line containing " for " followed by duration (e.g., "for 2m", "for 35s")
-		if strings.HasPrefix(trimmed, "✻") && strings.Contains(trimmed, " for ") {
-			continue
-		}
-		for _, s := range spinners {
-			if strings.HasPrefix(trimmed, s) {
-				return true
-			}
-		}
-		// Also check for status line spinner (e.g., "◐ Bash:")
-		if strings.Contains(line, "◐ ") || strings.Contains(line, "◑ ") ||
-			strings.Contains(line, "◒ ") || strings.Contains(line, "◓ ") {
-			return true
-		}
-	}
-
-	// Activity indicators that appear in thinking/status lines
-	activityIndicators := []string{
-		"Thinking…", "Cooking…", "Pondering…", "Flowing…", "Crunching…",
-		"Churning…", "Sublimating…", "thinking)", "thought for",
-		"Running PreToolUse", "Running PostToolUse", "Running…",
-		"(timeout", "· timeout", "Waiting for task",
-	}
-	for _, indicator := range activityIndicators {
-		if strings.Contains(paneContent, indicator) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// isTextStuckInBuffer checks if the sent text is still sitting in the input
-// buffer (visible after the ❯ prompt) rather than having been submitted.
-func isTextStuckInBuffer(paneContent string, sentText string) bool {
-	lines := strings.Split(paneContent, "\n")
-
-	// Find the last line containing the prompt marker
-	promptLineIdx := -1
-	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.Contains(lines[i], "❯") {
-			promptLineIdx = i
-			break
-		}
-	}
-	if promptLineIdx == -1 {
-		return false // no prompt visible, can't tell
-	}
-
-	// Get content after the prompt marker on the prompt line
-	promptLine := lines[promptLineIdx]
-	promptIdx := strings.LastIndex(promptLine, "❯")
-	afterPromptOnLine := strings.TrimSpace(promptLine[promptIdx+len("❯"):])
-
-	// Also check the lines immediately following the prompt (multi-line input)
-	var inputAreaContent string
-	inputAreaContent = afterPromptOnLine
-	for i := promptLineIdx + 1; i < len(lines) && i < promptLineIdx+10; i++ {
-		line := strings.TrimSpace(lines[i])
-		// Stop at status line indicators (Claude HUD, etc.)
-		if strings.HasPrefix(line, "[") || strings.HasPrefix(line, "───") {
-			break
-		}
-		inputAreaContent += " " + line
-	}
-	inputAreaContent = strings.TrimSpace(inputAreaContent)
-
-	// If input area has content, text is stuck
-	if len(inputAreaContent) > 0 {
-		// Double check it's actually our text (not just stray characters)
-		check := sentText
-		if idx := strings.IndexByte(check, '\n'); idx > 0 {
-			check = check[:idx]
-		}
-		if len(check) > 30 {
-			check = check[:30]
-		}
-		check = strings.TrimSpace(check)
-		// If we can find even a small prefix of the sent text, it's stuck
-		if len(check) >= 4 && strings.Contains(inputAreaContent, check) {
-			return true
-		}
-		// Or if there's substantial content in the input area
-		if len(inputAreaContent) > 10 {
-			return true
-		}
-	}
-
-	return false
+	time.Sleep(100 * time.Millisecond)
+	cmd = exec.Command(tmuxPath, "send-keys", "-t", session, "Enter")
+	return cmd.Run()
 }
 
 func killTmuxSession(name string) error {
