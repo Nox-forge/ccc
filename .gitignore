@@ -12,8 +12,22 @@ coverage.out
 
 # Build artifacts
 build/
+ffmpeg-*/
+
+# Database
+*.db
 
 # OS files
 .DS_Store
+
+# Test scripts
+test_*.sh
+
+# Backup files
+*.old
+*.simple
+*.bak
+
+# Telegram artifacts
 ping-telegram
 telegram_*.jpg

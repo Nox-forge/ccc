@@ -1,8 +1,8 @@
 # ccc - Claude Code Companion
 
-> Your companion for [Claude Code](https://claude.ai/claude-code) - control sessions remotely via Telegram. Start sessions from your phone, interact with Claude, and receive notifications when tasks complete.
+> Your companion for [Claude Code](https://claude.ai/claude-code) - control sessions remotely via Telegram, Signal, WebSocket, and more. Start sessions from your phone, interact with Claude, and receive notifications when tasks complete.
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev)
+[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## Why ccc?
@@ -11,13 +11,15 @@ Ever wanted to:
 - Start a Claude Code session from your phone while away from your computer?
 - Continue a session seamlessly between your phone and PC?
 - Get notified when Claude finishes a long-running task?
+- Connect Claude to multiple messaging platforms at once?
 
-**ccc** bridges Claude Code with Telegram, letting you control sessions from anywhere.
+**ccc** bridges Claude Code with Telegram (and more), letting you control sessions from anywhere.
 
 ## Features
 
+### Core
 - **100% Self-Hosted** - Runs entirely on your machine, no third-party servers
-- **Privacy First** - Your code and conversations never leave your computer (except to Telegram for messages you send)
+- **Privacy First** - Your code and conversations never leave your computer (except to messaging platforms for messages you send)
 - **Remote Control** - Start and manage Claude Code sessions from Telegram
 - **Multi-Session** - Run multiple concurrent sessions, each with its own Telegram topic
 - **Seamless Handoff** - Start on phone, continue on PC (or vice versa)
@@ -27,6 +29,14 @@ Ever wanted to:
 - **Image Support** - Send images to Claude for analysis
 - **tmux Integration** - Sessions persist and can be attached from any terminal
 - **One-shot Queries** - Quick Claude questions via private chat
+
+### v2.0.0 - Multi-Channel & Gateway
+- **SQLite Persistence** - Session messages stored locally with full history via REST API
+- **WebSocket Gateway** - Real-time bidirectional protocol on `ws://127.0.0.1:18789` for programmatic access
+- **Multi-Channel Support** - Pluggable channel architecture (Telegram, Signal, Discord stub)
+- **Signal Integration** - Receive and relay messages via Signal (using signal-cli)
+- **Skill Management** - Browse, install, sync, and check readiness of Claude Code skills via ClawHub and OpenClaw
+- **Memory Enrichment** - Optionally enrich messages with context from a Memory Agent before sending to Claude
 
 ## Demo Workflow
 
@@ -75,7 +85,7 @@ Ever wanted to:
 ### From Source
 
 ```bash
-git clone https://github.com/kidandcat/ccc.git
+git clone https://github.com/Nox-forge/ccc.git
 cd ccc
 make install
 ```
@@ -86,7 +96,7 @@ This builds, signs (on macOS), and installs to `~/bin/`.
 
 ```bash
 ccc --version
-# ccc version 1.0.0
+# ccc version 2.0.0
 ```
 
 > **macOS troubleshooting**: If you get `killed` when running ccc, the binary needs to be signed:
@@ -133,11 +143,17 @@ That's it! You're ready to control Claude Code from Telegram.
 |---------|-------------|
 | `ccc` | Start/attach Claude session in current directory |
 | `ccc -c` | Continue previous session |
+| `ccc start <name> [path]` | Create detached session (no terminal attach) |
 | `ccc "message"` | Send notification (if away mode on) |
 | `ccc send <file>` | Send a file to Telegram (see [File Transfer](#file-transfer)) |
 | `ccc doctor` | Check all dependencies and configuration |
 | `ccc config` | Show current configuration |
 | `ccc config projects-dir <path>` | Set base directory for new projects |
+| `ccc skills` | List installed skills and readiness status |
+| `ccc skills sync` | Sync external skills into Claude Code |
+| `ccc skills install <slug>` | Install a skill from ClawHub |
+| `ccc skills search <query>` | Search ClawHub for skills |
+| `ccc skills check` | Check skill dependency readiness |
 | `ccc --help` | Show help |
 | `ccc --version` | Show version |
 
@@ -158,6 +174,9 @@ That's it! You're ready to control Claude Code from Telegram.
 | `/ping` | Check if bot is alive |
 | `/away` | Toggle away mode (notifications) |
 | `/c <cmd>` | Run shell command on your machine |
+| `/skills` | List installed skills |
+| `/skills sync` | Sync skills into Claude Code |
+| `/skills install <slug>` | Install skill from ClawHub |
 
 **In private chat:**
 - Send any message to run a one-shot Claude query
@@ -351,6 +370,9 @@ Config is stored in `~/.ccc.json`:
 | `projects_dir` | Base directory for new projects (default: `~`) |
 | `transcription_cmd` | Command for voice transcription (optional) |
 | `away` | When true, notifications are sent |
+| `gateway` | Gateway config: `token`, `port` (default 18789) |
+| `channels` | Multi-channel config: `signal` (number, enabled), `discord` (token, enabled) |
+| `skills` | Skills config: `auto_sync` (bool) |
 
 > **Note**: Session paths are stored at creation time. Changing `projects_dir` only affects new sessions.
 
@@ -465,21 +487,45 @@ The `/kill` command performs a **soft delete**:
 ## How It Works
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Telegram   │────▶│     ccc     │────▶│    tmux     │
-│   (phone)   │◀────│   listen    │◀────│   session   │
-└─────────────┘     └─────────────┘     └─────────────┘
-                           │                   │
-                           │                   ▼
-                           │            ┌─────────────┐
-                           └───────────▶│ Claude Code │
-                              hook      └─────────────┘
+┌─────────────┐     ┌─────────────────────────┐     ┌─────────────┐
+│  Telegram   │────▶│                         │────▶│    tmux     │
+│   (phone)   │◀────│       ccc listen        │◀────│   session   │
+└─────────────┘     │                         │     └──────┬──────┘
+                    │  ┌─────────┐ ┌───────┐  │            │
+┌─────────────┐     │  │ Gateway │ │SQLite │  │            ▼
+│   Signal    │────▶│  │  :18789 │ │  DB   │  │     ┌─────────────┐
+└─────────────┘     │  └─────────┘ └───────┘  │     │ Claude Code │
+                    │                         │     └─────────────┘
+┌─────────────┐     │  ┌─────────────────┐    │
+│  WebSocket  │────▶│  │ Channel Router  │    │
+│  (clients)  │◀────│  └─────────────────┘    │
+└─────────────┘     └─────────────────────────┘
 ```
 
 1. `ccc listen` runs as a service, polling Telegram for messages
-2. Messages in topics are forwarded to the corresponding tmux session
+2. Messages from any channel are routed to the corresponding tmux session
 3. Claude Code runs inside tmux with a hook that sends responses back
-4. You can attach to any session from terminal with `ccc`
+4. The WebSocket gateway provides real-time programmatic access
+5. All messages are persisted in SQLite for history and REST queries
+6. You can attach to any session from terminal with `ccc`
+
+## WebSocket Gateway
+
+The gateway runs on `ws://127.0.0.1:18789` and provides a real-time interface for programmatic access to CCC.
+
+**Authentication**: Uses a bearer token (shared with OpenClaw if configured).
+
+**Client commands** (JSON over WebSocket):
+- `message` - Send a message to a session
+- `list` - List active sessions
+- `new` - Create a new session
+- `restart` - Restart a session
+- `kill` - Kill a session
+
+**REST endpoints**:
+- `GET /health` - Health check
+- `GET /sessions` - List sessions with status
+- `GET /sessions/:name/messages` - Message history from SQLite
 
 ## Privacy & Security
 
@@ -547,4 +593,4 @@ Contributions welcome! Please:
 
 ---
 
-Made with Claude Code 🤖
+Originally forked from [kidandcat/ccc](https://github.com/kidandcat/ccc). Extended with multi-channel support, WebSocket gateway, SQLite persistence, skill management, and memory enrichment.
